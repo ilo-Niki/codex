@@ -169,14 +169,6 @@ pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<P
         )));
     }
 
-    request
-        .raw_sink
-        .record_runtime_compatibility(&auth_profile_scope, &capability_revision)
-        .await
-        .map_err(|err| {
-            CodexErr::Fatal(format!("failed to bind Patch runtime compatibility: {err}"))
-        })?;
-
     let thread_id = ThreadId::new();
     let installation_id = resolve_installation_id(&config.codex_home)
         .await
@@ -228,6 +220,8 @@ pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<P
             request.summary,
             /*service_tier*/ None,
             &responses_metadata,
+            &auth_profile_scope,
+            &capability_revision,
             request.raw_sink,
         )
         .await?;
@@ -238,7 +232,7 @@ pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<P
     })
 }
 
-fn digest_compatibility_value(domain: &str, value: &[u8]) -> String {
+pub(crate) fn digest_compatibility_value(domain: &str, value: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain.as_bytes());
     hasher.update([0]);

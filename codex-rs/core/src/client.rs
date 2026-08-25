@@ -1882,9 +1882,37 @@ impl ModelClientSession {
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
+        expected_auth_profile_scope: &str,
+        capability_revision: &str,
         raw_sink: Arc<dyn codex_api::RawResponseSink>,
     ) -> Result<ResponseStream> {
         let client_setup = self.client.current_client_setup().await?;
+        let actual_auth_profile_scope = client_setup
+            .auth
+            .as_ref()
+            .and_then(CodexAuth::get_account_id)
+            .map(|account_id| {
+                crate::patch_runtime::digest_compatibility_value(
+                    "chatgpt-account",
+                    account_id.as_bytes(),
+                )
+            })
+            .ok_or_else(|| {
+                CodexErr::InvalidRequest(
+                    "Patch request has no authenticated ChatGPT account scope".to_string(),
+                )
+            })?;
+        if actual_auth_profile_scope != expected_auth_profile_scope {
+            return Err(CodexErr::InvalidRequest(
+                "Patch authenticated account changed during request setup".to_string(),
+            ));
+        }
+        raw_sink
+            .record_runtime_compatibility(&actual_auth_profile_scope, capability_revision)
+            .await
+            .map_err(|err| {
+                CodexErr::Fatal(format!("failed to bind Patch runtime compatibility: {err}"))
+            })?;
         let request_auth_context = AuthRequestTelemetryContext::new(
             client_setup.auth.as_ref().map(CodexAuth::auth_mode),
             client_setup.api_auth.as_ref(),
