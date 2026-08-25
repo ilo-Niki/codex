@@ -63,6 +63,14 @@ pub trait RawResponseSink: Send + Sync {
         &'a self,
         item: Box<RawValue>,
     ) -> BoxFuture<'a, Result<(), ApiError>>;
+
+    /// Authorizes the single WebSocket send after request custody is durable.
+    ///
+    /// Implementations that coordinate cancellation may reject this immediately
+    /// before dispatch. Existing observers retain their typed-event behavior.
+    fn authorize_transport_dispatch<'a>(&'a self) -> BoxFuture<'a, Result<(), ApiError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 struct WsStream {
@@ -715,6 +723,9 @@ async fn run_websocket_response_stream(
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
+    if let Some(raw_sink) = raw_sink {
+        raw_sink.authorize_transport_dispatch().await?;
+    }
     send_websocket_request(
         ws_stream,
         request_text,
