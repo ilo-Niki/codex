@@ -17,6 +17,7 @@ use codex_websocket_client::WebSocketConnection;
 use codex_websocket_client::WebSocketConnector;
 use futures::SinkExt;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use http::HeaderMap;
 use http::HeaderName;
 use http::HeaderValue;
@@ -24,6 +25,7 @@ use http::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::map::Map as JsonMap;
+use serde_json::value::RawValue;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -45,6 +47,23 @@ use tungstenite::extensions::ExtensionsConfig;
 use tungstenite::extensions::compression::deflate::DeflateConfig;
 use tungstenite::protocol::WebSocketConfig;
 use url::Url;
+
+/// Receives exact native JSON item tokens before typed Responses conversion.
+///
+/// The sink is opt-in so existing Codex consumers retain their typed-event API.
+/// A caller that supplies a sink can require durable native custody before a
+/// request is sent or an output item is converted.
+pub trait RawResponseSink: Send + Sync {
+    fn record_request_input<'a>(
+        &'a self,
+        items: Vec<Box<RawValue>>,
+    ) -> BoxFuture<'a, Result<(), ApiError>>;
+
+    fn record_completed_output_item<'a>(
+        &'a self,
+        item: Box<RawValue>,
+    ) -> BoxFuture<'a, Result<(), ApiError>>;
+}
 
 struct WsStream {
     tx_command: mpsc::Sender<WsCommand>,
@@ -233,6 +252,19 @@ impl ResponsesWebsocketConnection {
         connection_reused: bool,
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
+        self.stream_request_with_raw_sink(request, connection_reused, turn_state, None)
+            .await
+    }
+
+    /// Streams one request while preserving exact native item tokens through an
+    /// opt-in sink before transport and typed conversion.
+    pub async fn stream_request_with_raw_sink(
+        &self,
+        request: ResponsesWsRequest<'_>,
+        connection_reused: bool,
+        turn_state: Option<Arc<OnceLock<String>>>,
+        raw_sink: Option<Arc<dyn RawResponseSink>>,
+    ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
         let stream = Arc::clone(&self.stream);
@@ -266,6 +298,11 @@ impl ResponsesWebsocketConnection {
             connection_reused,
         };
         let request_text = serialize_websocket_request(&request)?;
+        if let Some(raw_sink) = raw_sink.as_ref() {
+            raw_sink
+                .record_request_input(raw_request_input_items(&request_text)?)
+                .await?;
+        }
 
         let current_span = Span::current();
         tokio::spawn(
@@ -309,6 +346,7 @@ impl ResponsesWebsocketConnection {
                             idle_timeout,
                             telemetry,
                             turn_state.as_deref(),
+                            raw_sink.as_deref(),
                             &timing_log_context,
                         ) => result,
                         _ = tx_event.closed() => Err(ApiError::Stream(
@@ -672,6 +710,7 @@ async fn run_websocket_response_stream(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
     turn_state: Option<&OnceLock<String>>,
+    raw_sink: Option<&dyn RawResponseSink>,
     timing_log_context: &ResponsesWebsocketTimingLogContext,
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
@@ -710,6 +749,11 @@ async fn run_websocket_response_stream(
 
         match message {
             Message::Text(text) => {
+                if let Some(raw_sink) = raw_sink
+                    && let Some(raw_item) = raw_completed_output_item(&text)?
+                {
+                    raw_sink.record_completed_output_item(raw_item).await?;
+                }
                 if let Some(wrapped_error) = parse_wrapped_websocket_error_event(&text)
                     && let Some(error) =
                         map_wrapped_websocket_error_event(wrapped_error, text.to_string())
@@ -900,6 +944,55 @@ async fn send_websocket_request(
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct RawWebsocketRequest<'a> {
+    #[serde(borrow)]
+    input: Vec<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct RawWebsocketEvent<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    #[serde(borrow)]
+    item: Option<&'a RawValue>,
+}
+
+fn raw_request_input_items(request_text: &str) -> Result<Vec<Box<RawValue>>, ApiError> {
+    let request: RawWebsocketRequest<'_> = serde_json::from_str(request_text).map_err(|err| {
+        ApiError::Stream(format!("failed to inspect websocket request input: {err}"))
+    })?;
+    request
+        .input
+        .into_iter()
+        .map(|item| {
+            RawValue::from_string(item.get().to_owned()).map_err(|err| {
+                ApiError::Stream(format!(
+                    "failed to retain raw websocket request input: {err}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn raw_completed_output_item(text: &str) -> Result<Option<Box<RawValue>>, ApiError> {
+    let event: RawWebsocketEvent<'_> = match serde_json::from_str(text) {
+        Ok(event) => event,
+        Err(_) => return Ok(None),
+    };
+    if event.kind != "response.output_item.done" {
+        return Ok(None);
+    }
+    let item = event.item.ok_or_else(|| {
+        ApiError::Stream("response.output_item.done did not include an item".to_owned())
+    })?;
+    RawValue::from_string(item.get().to_owned())
+        .map(Some)
+        .map_err(|err| {
+            ApiError::Stream(format!("failed to retain raw completed output item: {err}"))
+        })
+}
+
 fn serialize_websocket_request(request: &ResponsesWsRequest<'_>) -> Result<String, ApiError> {
     serde_json::to_string(request)
         .map_err(|err| ApiError::Stream(format!("failed to encode websocket request: {err}")))
@@ -919,6 +1012,20 @@ mod tests {
     use serde_json::value::to_raw_value;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn raw_item_extractors_preserve_exact_json_tokens() {
+        let request = r#"{"type":"response.create","input":[{"type":"message","future":{"a":1}},{"type":"future","spaced" : true}]}"#;
+        let inputs = raw_request_input_items(request).unwrap();
+        assert_eq!(inputs[0].get(), r#"{"type":"message","future":{"a":1}}"#);
+        assert_eq!(inputs[1].get(), r#"{"type":"future","spaced" : true}"#);
+
+        let output = r#"{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"opaque","future":[1,2]}}"#;
+        assert_eq!(
+            raw_completed_output_item(output).unwrap().unwrap().get(),
+            r#"{"type":"reasoning","encrypted_content":"opaque","future":[1,2]}"#
+        );
+    }
 
     #[test]
     fn direct_serialization_preserves_websocket_request_payload() {
