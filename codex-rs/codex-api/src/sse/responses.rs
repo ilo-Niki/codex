@@ -2,6 +2,7 @@ use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::SafetyBuffering;
 use crate::common::SafetyBufferingTreatment;
+use crate::endpoint::responses_websocket::RawResponseSink;
 use crate::error::ApiError;
 use crate::rate_limits::parse_all_rate_limits;
 use crate::safety_buffering::treatment_from_headers;
@@ -16,6 +17,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use serde_json::value::RawValue;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -31,11 +33,12 @@ const OPENAI_MODEL_HEADER: &str = "openai-model";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
-pub fn spawn_response_stream(
+pub(crate) fn spawn_response_stream_with_raw_sink(
     stream_response: StreamResponse,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     turn_state: Option<Arc<OnceLock<String>>>,
+    raw_sink: Option<Arc<dyn RawResponseSink>>,
 ) -> ResponseStream {
     let rate_limit_snapshots = parse_all_rate_limits(&stream_response.headers);
     let models_etag = stream_response
@@ -89,6 +92,7 @@ pub fn spawn_response_stream(
             idle_timeout,
             telemetry,
             safety_buffering_treatment,
+            raw_sink,
         )
         .await;
     });
@@ -521,6 +525,30 @@ pub fn process_responses_event(
     Ok(None)
 }
 
+#[derive(Deserialize)]
+struct RawSseEvent<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    #[serde(borrow)]
+    item: Option<&'a RawValue>,
+}
+
+fn raw_completed_output_item(text: &str) -> Result<Option<Box<RawValue>>, ApiError> {
+    let event: RawSseEvent<'_> = serde_json::from_str(text)
+        .map_err(|error| ApiError::Stream(format!("failed to inspect raw SSE event: {error}")))?;
+    if event.kind != "response.output_item.done" {
+        return Ok(None);
+    }
+    let item = event.item.ok_or_else(|| {
+        ApiError::Stream("response.output_item.done did not include an item".to_owned())
+    })?;
+    RawValue::from_string(item.get().to_owned())
+        .map(Some)
+        .map_err(|err| {
+            ApiError::Stream(format!("failed to retain raw completed output item: {err}"))
+        })
+}
+
 #[cfg(test)]
 pub async fn process_sse(
     stream: ByteStream,
@@ -534,6 +562,7 @@ pub async fn process_sse(
         idle_timeout,
         telemetry,
         SafetyBufferingTreatment::default(),
+        None,
     )
     .await;
 }
@@ -544,6 +573,7 @@ async fn process_sse_with_treatment(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     safety_buffering_treatment: SafetyBufferingTreatment,
+    raw_sink: Option<Arc<dyn RawResponseSink>>,
 ) {
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
@@ -592,6 +622,21 @@ async fn process_sse_with_treatment(
                 continue;
             }
         };
+        if let Some(raw_sink) = raw_sink.as_ref() {
+            match raw_completed_output_item(&sse.data) {
+                Ok(Some(item)) => {
+                    if let Err(error) = raw_sink.record_completed_output_item(item).await {
+                        let _ = tx_event.send(Err(error)).await;
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = tx_event.send(Err(error)).await;
+                    return;
+                }
+            }
+        }
         let model_verifications = event.model_verifications();
         let turn_moderation_metadata = event.turn_moderation_metadata();
         let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
@@ -1355,11 +1400,12 @@ mod tests {
             bytes: Box::pin(bytes),
         };
 
-        let mut stream = spawn_response_stream(
+        let mut stream = spawn_response_stream_with_raw_sink(
             stream_response,
             idle_timeout(),
             /*telemetry*/ None,
             /*turn_state*/ None,
+            /*raw_sink*/ None,
         );
         assert_eq!(stream.upstream_request_id.as_deref(), Some("req-1"));
         let event = stream
@@ -1395,11 +1441,12 @@ mod tests {
             bytes: Box::pin(bytes),
         };
 
-        let mut stream = spawn_response_stream(
+        let mut stream = spawn_response_stream_with_raw_sink(
             stream_response,
             idle_timeout(),
             /*telemetry*/ None,
             /*turn_state*/ None,
+            /*raw_sink*/ None,
         );
         let mut events = Vec::new();
         while let Some(event) = stream.rx_event.recv().await {

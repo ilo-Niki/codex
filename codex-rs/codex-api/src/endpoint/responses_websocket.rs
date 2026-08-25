@@ -23,6 +23,7 @@ use http::HeaderName;
 use http::HeaderValue;
 use http::StatusCode;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use serde_json::map::Map as JsonMap;
 use serde_json::value::RawValue;
@@ -310,6 +311,49 @@ impl ResponsesWebsocketConnection {
         turn_state: Option<Arc<OnceLock<String>>>,
         raw_sink: Option<Arc<dyn RawResponseSink>>,
     ) -> Result<ResponseStream, ApiError> {
+        let request_text = serialize_websocket_request(&request)?;
+        self.stream_serialized_request(
+            request,
+            request_text,
+            connection_reused,
+            turn_state,
+            raw_sink,
+        )
+        .await
+    }
+
+    /// Streams one request whose input array is assembled from retained native JSON items and a
+    /// fresh raw suffix. The retained items are serialized directly as [`RawValue`] tokens; they
+    /// are never deserialized into typed response items.
+    pub async fn stream_request_with_raw_input(
+        &self,
+        request: ResponsesWsRequest<'_>,
+        retained_prefix: &[Box<RawValue>],
+        fresh_suffix: &[Box<RawValue>],
+        connection_reused: bool,
+        turn_state: Option<Arc<OnceLock<String>>>,
+        raw_sink: Option<Arc<dyn RawResponseSink>>,
+    ) -> Result<ResponseStream, ApiError> {
+        let request_text =
+            serialize_websocket_request_with_raw_input(&request, retained_prefix, fresh_suffix)?;
+        self.stream_serialized_request(
+            request,
+            request_text,
+            connection_reused,
+            turn_state,
+            raw_sink,
+        )
+        .await
+    }
+
+    async fn stream_serialized_request(
+        &self,
+        request: ResponsesWsRequest<'_>,
+        request_text: String,
+        connection_reused: bool,
+        turn_state: Option<Arc<OnceLock<String>>>,
+        raw_sink: Option<Arc<dyn RawResponseSink>>,
+    ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
         let stream = Arc::clone(&self.stream);
@@ -342,7 +386,6 @@ impl ResponsesWebsocketConnection {
             warmup: ws_request.generate == Some(false),
             connection_reused,
         };
-        let request_text = serialize_websocket_request(&request)?;
         if let Some(raw_sink) = raw_sink.as_ref() {
             raw_sink
                 .record_request_input(raw_request_input_items(&request_text)?)
@@ -1050,6 +1093,75 @@ fn serialize_websocket_request(request: &ResponsesWsRequest<'_>) -> Result<Strin
         .map_err(|err| ApiError::Stream(format!("failed to encode websocket request: {err}")))
 }
 
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum RawResponsesWsRequest<'a> {
+    #[serde(rename = "response.create")]
+    ResponseCreate(RawResponseCreateWsRequest<'a>),
+}
+
+#[derive(Serialize)]
+struct RawResponseCreateWsRequest<'a> {
+    model: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    instructions: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
+    input: Vec<&'a RawValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a RawValue>,
+    tool_choice: &'a str,
+    parallel_tool_calls: bool,
+    reasoning: Option<&'a crate::common::Reasoning>,
+    store: bool,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<&'a crate::common::StreamOptions>,
+    include: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a crate::common::TextControls>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generate: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+fn serialize_websocket_request_with_raw_input(
+    request: &ResponsesWsRequest<'_>,
+    retained_prefix: &[Box<RawValue>],
+    fresh_suffix: &[Box<RawValue>],
+) -> Result<String, ApiError> {
+    let ResponsesWsRequest::ResponseCreate(request) = request;
+    let mut input = Vec::with_capacity(retained_prefix.len() + fresh_suffix.len());
+    input.extend(retained_prefix.iter().map(std::convert::AsRef::as_ref));
+    input.extend(fresh_suffix.iter().map(std::convert::AsRef::as_ref));
+    let request = RawResponseCreateWsRequest {
+        model: request.model,
+        instructions: request.instructions,
+        previous_response_id: request.previous_response_id.clone(),
+        input,
+        tools: request.tools,
+        tool_choice: request.tool_choice,
+        parallel_tool_calls: request.parallel_tool_calls,
+        reasoning: request.reasoning,
+        store: request.store,
+        stream: request.stream,
+        stream_options: request.stream_options,
+        include: request.include,
+        service_tier: request.service_tier,
+        prompt_cache_key: request.prompt_cache_key,
+        text: request.text,
+        generate: request.generate,
+        client_metadata: request.client_metadata.clone(),
+    };
+    serde_json::to_string(&RawResponsesWsRequest::ResponseCreate(request))
+        .map_err(|err| ApiError::Stream(format!("failed to encode raw websocket request: {err}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,6 +1196,45 @@ mod tests {
         assert!(
             raw_completed_output_item(r#"{"type":"response.output_item.done","item":"#).is_err()
         );
+    }
+
+    #[test]
+    fn raw_request_framing_preserves_unknown_prefix_and_suffix_items() {
+        let request = ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
+            model: "gpt-test",
+            instructions: "",
+            previous_response_id: None,
+            input: &[],
+            tools: None,
+            tool_choice: "auto",
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: true,
+            stream_options: None,
+            include: &[],
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            generate: None,
+            client_metadata: None,
+        });
+        let prefix = vec![
+            RawValue::from_string(
+                r#"{ "type":"future_item", "unknown": {"x":1}, "spaced" : true }"#.to_string(),
+            )
+            .unwrap(),
+        ];
+        let suffix = vec![
+            RawValue::from_string(r#"{"type":"message","future_variant":[1,2,3]}"#.to_string())
+                .unwrap(),
+        ];
+        let encoded = serialize_websocket_request_with_raw_input(&request, &prefix, &suffix)
+            .expect("raw request should encode");
+        assert!(
+            encoded.contains(r#"{ "type":"future_item", "unknown": {"x":1}, "spaced" : true }"#)
+        );
+        assert!(encoded.contains(r#"{"type":"message","future_variant":[1,2,3]}"#));
     }
 
     #[test]

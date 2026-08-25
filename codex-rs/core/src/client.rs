@@ -30,6 +30,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use serde_json::value::RawValue;
+
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::AuthProvider;
@@ -397,6 +399,19 @@ impl WebsocketSession {
 enum WebsocketStreamOutcome {
     Stream(ResponseStream),
     FallbackToHttp,
+}
+
+/// Transport route used by a Patch full-input request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FullInputRoute {
+    WebSocket,
+    Http,
+}
+
+/// Stream and route selected for a Patch full-input request.
+pub(crate) struct FullInputStream {
+    pub(crate) stream: ResponseStream,
+    pub(crate) route: FullInputRoute,
 }
 
 /// Result of opening a WebRTC Realtime call.
@@ -1465,6 +1480,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
+        raw_sink: Option<Arc<dyn codex_api::RawResponseSink>>,
     ) -> Result<ResponseStream> {
         let auth_manager = self.client.state.provider.auth_manager();
         let mut auth_recovery = auth_manager
@@ -1528,7 +1544,25 @@ impl ModelClientSession {
                 client_setup.api_auth,
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
-            let stream_result = client.stream_request(request, options).await;
+            let stream_result = match raw_sink.as_ref() {
+                Some(raw_sink) => {
+                    let raw_items = request
+                        .input
+                        .iter()
+                        .map(serde_json::value::to_raw_value)
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    client
+                        .stream_request_with_raw_input(
+                            &request,
+                            &[],
+                            &raw_items,
+                            options,
+                            Some(Arc::clone(raw_sink)),
+                        )
+                        .await
+                }
+                None => client.stream_request(request, options).await,
+            };
 
             match stream_result {
                 Ok(stream) => {
@@ -1608,6 +1642,7 @@ impl ModelClientSession {
         warmup: bool,
         request_trace: Option<W3cTraceContext>,
         inference_trace: &InferenceTraceContext,
+        raw_sink: Option<Arc<dyn codex_api::RawResponseSink>>,
     ) -> Result<WebsocketStreamOutcome> {
         let provider = Arc::clone(&self.client.state.provider);
         let auth_manager = provider.auth_manager();
@@ -1745,10 +1780,11 @@ impl ModelClientSession {
                     ))
                 })?;
             let stream_result = websocket_connection
-                .stream_request(
+                .stream_request_with_raw_sink(
                     ws_request,
                     self.websocket_session.connection_reused(),
                     Some(Arc::clone(&self.turn_state)),
+                    raw_sink.clone(),
                 )
                 .await;
             if let Some(original_item_ids) = original_item_ids {
@@ -1845,6 +1881,7 @@ impl ModelClientSession {
                 /*warmup*/ true,
                 current_span_w3c_trace_context(),
                 &disabled_trace,
+                None,
             )
             .await
         {
@@ -1865,6 +1902,195 @@ impl ModelClientSession {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Streams one full-input request from retained raw items and a fresh raw suffix.
+    ///
+    /// The retained prefix is passed directly to the maintained WebSocket or HTTP serializer;
+    /// typed response-item preparation is intentionally bypassed. A fresh session is expected for
+    /// each Patch logical turn. WebSocket is selected while enabled; callers can disable it once
+    /// and retry this finite operation on the supported HTTP Responses route.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_full_input_with_raw_items(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        retained_prefix: &[Box<RawValue>],
+        fresh_suffix: &[Box<RawValue>],
+        raw_sink: Arc<dyn codex_api::RawResponseSink>,
+    ) -> Result<FullInputStream> {
+        if self.client.responses_websocket_enabled() {
+            let client_setup = self.client.current_client_setup().await?;
+            let request = self.client.build_responses_request(
+                prompt,
+                model_info,
+                effort.clone(),
+                summary,
+                service_tier.clone(),
+                responses_metadata,
+            )?;
+            let mut websocket_metadata = responses_metadata.clone();
+            websocket_metadata.routing_hint = self.client.build_routing_hint_header(
+                client_setup.auth.as_ref(),
+                &request.model,
+                request.service_tier.as_deref(),
+            );
+            let request_auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                PendingUnauthorizedRetry::default(),
+            );
+            let connection = match self
+                .client
+                .connect_websocket(
+                    session_telemetry,
+                    client_setup.api_provider,
+                    client_setup.api_auth,
+                    &websocket_metadata,
+                    request_auth_context,
+                    RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
+                )
+                .await
+            {
+                Ok(connection) => connection,
+                Err(ApiError::Transport(TransportError::Http { status, .. }))
+                    if status == StatusCode::UPGRADE_REQUIRED =>
+                {
+                    self.try_switch_fallback_transport(session_telemetry, model_info);
+                    return self
+                        .stream_full_input_http_with_raw_items(
+                            &request,
+                            model_info,
+                            session_telemetry,
+                            responses_metadata,
+                            retained_prefix,
+                            fresh_suffix,
+                            raw_sink,
+                        )
+                        .await;
+                }
+                Err(error) => return Err(self.client.state.provider.map_api_error(error)),
+            };
+            let mut client_metadata = self
+                .client
+                .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);
+            client_metadata = response_create_client_metadata(
+                Some(std::mem::take(&mut client_metadata)),
+                current_span_w3c_trace_context().as_ref(),
+            )
+            .unwrap_or_default();
+            let ws_payload = ResponseCreateWsRequest {
+                previous_response_id: None,
+                input: &request.input,
+                generate: None,
+                client_metadata: Some(client_metadata),
+                ..ResponseCreateWsRequest::from(&request)
+            };
+            let ws_request = ResponsesWsRequest::ResponseCreate(ws_payload);
+            let stream = connection
+                .stream_request_with_raw_input(
+                    ws_request,
+                    retained_prefix,
+                    fresh_suffix,
+                    /*connection_reused*/ false,
+                    None,
+                    Some(raw_sink),
+                )
+                .await
+                .map_err(|error| self.client.state.provider.map_api_error(error))?;
+            let (stream, _) = map_response_stream(
+                stream,
+                session_telemetry_for_request(session_telemetry, &request),
+                InferenceTraceAttempt::disabled(),
+                Arc::clone(&self.client.state.provider),
+            );
+            return Ok(FullInputStream {
+                stream,
+                route: FullInputRoute::WebSocket,
+            });
+        }
+
+        let request = self.client.build_responses_request(
+            prompt,
+            model_info,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+        )?;
+        self.stream_full_input_http_with_raw_items(
+            &request,
+            model_info,
+            session_telemetry,
+            responses_metadata,
+            retained_prefix,
+            fresh_suffix,
+            raw_sink,
+        )
+        .await
+    }
+
+    async fn stream_full_input_http_with_raw_items(
+        &self,
+        request: &ResponsesApiRequest,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        responses_metadata: &CodexResponsesMetadata,
+        retained_prefix: &[Box<RawValue>],
+        fresh_suffix: &[Box<RawValue>],
+        raw_sink: Arc<dyn codex_api::RawResponseSink>,
+    ) -> Result<FullInputStream> {
+        let client_setup = self.client.current_client_setup().await?;
+        let transport = self
+            .client
+            .build_api_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)?;
+        let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
+            session_telemetry,
+            AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                client_setup.agent_identity_telemetry.clone(),
+                PendingUnauthorizedRetry::default(),
+            ),
+            RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
+            self.client.state.auth_env_telemetry.clone(),
+        );
+        let options = self
+            .build_responses_options(
+                responses_metadata,
+                self.responses_request_compression(client_setup.auth.as_ref()),
+                model_info.use_responses_lite,
+            )
+            .await;
+        let client =
+            ApiResponsesClient::new(transport, client_setup.api_provider, client_setup.api_auth)
+                .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+        let stream = client
+            .stream_request_with_raw_input(
+                request,
+                retained_prefix,
+                fresh_suffix,
+                options,
+                Some(raw_sink),
+            )
+            .await
+            .map_err(|error| self.client.state.provider.map_api_error(error))?;
+        let (stream, _) = map_response_stream(
+            stream,
+            session_telemetry_for_request(session_telemetry, request),
+            InferenceTraceAttempt::disabled(),
+            Arc::clone(&self.client.state.provider),
+        );
+        Ok(FullInputStream {
+            stream,
+            route: FullInputRoute::Http,
+        })
     }
 
     /// Streams one full-input Responses request over a fresh websocket.
@@ -2022,6 +2248,33 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.stream_with_raw_sink(
+            prompt,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            inference_trace,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_with_raw_sink(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        inference_trace: &InferenceTraceContext,
+        raw_sink: Option<Arc<dyn codex_api::RawResponseSink>>,
+    ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
@@ -2039,6 +2292,7 @@ impl ModelClientSession {
                             /*warmup*/ false,
                             request_trace,
                             inference_trace,
+                            raw_sink.clone(),
                         )
                         .await?
                     {
@@ -2058,6 +2312,7 @@ impl ModelClientSession {
                     service_tier,
                     responses_metadata,
                     inference_trace,
+                    raw_sink,
                 )
                 .await
             }
