@@ -229,7 +229,7 @@ pub struct CodexResponsesMetadata {
 }
 
 impl CodexResponsesMetadata {
-    pub(crate) fn new(
+    pub fn new(
         installation_id: String,
         session_id: String,
         thread_id: String,
@@ -261,6 +261,12 @@ impl CodexResponsesMetadata {
             turn_started_at_unix_ms: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    /// Attaches the caller-owned turn identity to otherwise minimal metadata.
+    pub fn with_turn_id(mut self, turn_id: String) -> Self {
+        self.turn_id = Some(turn_id);
+        self
     }
 
     pub(crate) fn has_turn_metadata(&self) -> bool {

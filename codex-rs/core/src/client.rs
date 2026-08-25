@@ -275,6 +275,8 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    /// Whether this session's websocket state may be returned to the client cache on drop.
+    cache_websocket_session_on_drop: bool,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -496,6 +498,20 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            cache_websocket_session_on_drop: true,
+            turn_state: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Creates a one-shot session with no cached websocket or continuation state.
+    ///
+    /// Unlike [`Self::new_session`], dropping this session never returns transport state to the
+    /// client cache. This is intended for callers that require one full-input websocket request.
+    pub fn new_fresh_session(&self) -> ModelClientSession {
+        ModelClientSession {
+            client: self.clone(),
+            websocket_session: WebsocketSession::default(),
+            cache_websocket_session_on_drop: false,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -1159,9 +1175,11 @@ impl ModelClient {
 
 impl Drop for ModelClientSession {
     fn drop(&mut self) {
-        let websocket_session = std::mem::take(&mut self.websocket_session);
-        self.client
-            .store_cached_websocket_session(websocket_session);
+        if self.cache_websocket_session_on_drop {
+            let websocket_session = std::mem::take(&mut self.websocket_session);
+            self.client
+                .store_cached_websocket_session(websocket_session);
+        }
     }
 }
 
@@ -1849,6 +1867,113 @@ impl ModelClientSession {
         }
     }
 
+    /// Streams one full-input Responses request over a fresh websocket.
+    ///
+    /// This is deliberately separate from [`Self::stream`]: it makes exactly one websocket
+    /// connection and request attempt, never performs prewarm, auth recovery, HTTP fallback, or
+    /// websocket-session caching, and never sends a previous response id or incremental delta.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_full_input_websocket_once_with_raw_sink(
+        &mut self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        raw_sink: Arc<dyn codex_api::RawResponseSink>,
+    ) -> Result<ResponseStream> {
+        let client_setup = self.client.current_client_setup().await?;
+        let request_auth_context = AuthRequestTelemetryContext::new(
+            client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+            client_setup.api_auth.as_ref(),
+            client_setup.agent_identity_telemetry.clone(),
+            PendingUnauthorizedRetry::default(),
+        );
+        let mut request = self.client.build_responses_request(
+            prompt,
+            model_info,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+        )?;
+        let mut websocket_metadata = responses_metadata.clone();
+        websocket_metadata.routing_hint = self.client.build_routing_hint_header(
+            client_setup.auth.as_ref(),
+            &request.model,
+            request.service_tier.as_deref(),
+        );
+        let request_session_telemetry = session_telemetry_for_request(session_telemetry, &request);
+        let mut client_metadata = self
+            .client
+            .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);
+        let request_trace = current_span_w3c_trace_context();
+        let inference_trace_attempt = InferenceTraceAttempt::disabled();
+        let original_item_ids = request
+            .input
+            .iter()
+            .map(|item| item.id().cloned())
+            .collect::<Vec<_>>();
+        self.client
+            .prepare_response_items_for_request(&mut request.input);
+        let ws_payload = ResponseCreateWsRequest {
+            previous_response_id: None,
+            input: &request.input,
+            generate: None,
+            client_metadata: response_create_client_metadata(
+                Some(std::mem::take(&mut client_metadata)),
+                request_trace.as_ref(),
+            ),
+            ..ResponseCreateWsRequest::from(&request)
+        };
+        let mut ws_request = ResponsesWsRequest::ResponseCreate(ws_payload);
+        stamp_ws_stream_request_start_ms(&mut ws_request);
+        inference_trace_attempt.record_started(&ws_request);
+
+        let connection = self
+            .client
+            .connect_websocket(
+                session_telemetry,
+                client_setup.api_provider,
+                client_setup.api_auth,
+                &websocket_metadata,
+                request_auth_context,
+                RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
+            )
+            .await
+            .map_err(|err| self.client.state.provider.map_api_error(err))?;
+        let stream_result = connection
+            .stream_request_with_raw_sink(
+                ws_request,
+                /*connection_reused*/ false,
+                /*turn_state*/ None,
+                Some(raw_sink),
+            )
+            .await;
+        for (item, original_item_id) in request.input.iter_mut().zip(original_item_ids) {
+            item.set_id(original_item_id);
+        }
+        let stream_result = stream_result.map_err(|err| {
+            let response_debug_context = extract_response_debug_context_from_api_error(&err);
+            let err = self.client.state.provider.map_api_error(err);
+            inference_trace_attempt.record_failed(
+                &err,
+                response_debug_context.request_id.as_deref(),
+                /*output_items*/ &[],
+            );
+            err
+        })?;
+        let (stream, _) = map_response_stream(
+            stream_result,
+            request_session_telemetry,
+            inference_trace_attempt,
+            Arc::clone(&self.client.state.provider),
+        );
+        Ok(stream)
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Streams a single model request within the current turn.
     ///
@@ -2526,6 +2651,68 @@ impl WebsocketTelemetry for ApiTelemetry {
     ) {
         self.session_telemetry
             .record_websocket_event(result, duration);
+    }
+}
+
+#[cfg(test)]
+mod strict_session_tests {
+    use super::*;
+
+    fn test_client() -> ModelClient {
+        ModelClient::new(
+            /*auth_manager*/ None,
+            AgentIdentityAuthPolicy::JwtOnly,
+            ThreadId::new(),
+            codex_model_provider_info::create_oss_provider_with_base_url(
+                "https://example.com/v1",
+                WireApi::Responses,
+            ),
+            SessionSource::Cli,
+            "test_originator".to_string(),
+            /*model_verbosity*/ None,
+            /*enable_request_compression*/ false,
+            /*include_timing_metrics*/ false,
+            /*beta_features_header*/ None,
+            /*concurrent_reasoning_summaries_enabled*/ false,
+            /*attestation_provider*/ None,
+            HttpClientFactory::new(codex_http_client::OutboundProxyPolicy::ReqwestDefault),
+        )
+    }
+
+    #[test]
+    fn fresh_session_starts_empty_and_does_not_cache_on_drop() {
+        let client = test_client();
+        {
+            let mut session = client.new_session();
+            session.websocket_session.last_response_from_untraced_warmup = true;
+        }
+        assert!(
+            client
+                .state
+                .cached_websocket_session
+                .lock()
+                .expect("cache lock")
+                .last_response_from_untraced_warmup
+        );
+
+        {
+            let session = client.new_fresh_session();
+            assert!(!session.cache_websocket_session_on_drop);
+            assert!(session.websocket_session.connection.is_none());
+            assert!(session.websocket_session.last_request.is_none());
+            assert!(session.websocket_session.last_response_rx.is_none());
+            assert!(!session.websocket_session.last_response_from_untraced_warmup);
+            assert!(session.turn_state.get().is_none());
+        }
+
+        assert!(
+            client
+                .state
+                .cached_websocket_session
+                .lock()
+                .expect("cache lock")
+                .last_response_from_untraced_warmup
+        );
     }
 }
 

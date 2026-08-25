@@ -50,6 +50,18 @@ impl Default for Prompt {
 }
 
 impl Prompt {
+    /// Creates a prompt with caller-supplied input and base instructions but no model tools.
+    pub fn new_no_tools(input: Vec<ResponseItem>, base_instructions: BaseInstructions) -> Self {
+        Self {
+            input,
+            tools: Arc::default(),
+            parallel_tool_calls: false,
+            base_instructions,
+            output_schema: None,
+            output_schema_strict: true,
+        }
+    }
+
     pub(crate) fn get_formatted_input_for_request(
         &self,
         use_responses_lite: bool,
@@ -120,6 +132,22 @@ impl Stream for ResponseStream {
 impl Drop for ResponseStream {
     fn drop(&mut self) {
         self.consumer_dropped.cancel();
+    }
+}
+
+#[cfg(test)]
+mod no_tools_tests {
+    use super::Prompt;
+    use codex_protocol::models::BaseInstructions;
+
+    #[test]
+    fn new_no_tools_keeps_tools_empty_and_strict_defaults() {
+        let prompt = Prompt::new_no_tools(Vec::new(), BaseInstructions::default());
+
+        assert!(prompt.tools.is_empty());
+        assert!(!prompt.parallel_tool_calls);
+        assert!(prompt.output_schema.is_none());
+        assert!(prompt.output_schema_strict);
     }
 }
 

@@ -84,6 +84,7 @@ pub use mention_syntax::TOOL_MENTION_SIGIL;
 pub use utils::path_utils;
 pub(crate) mod plugins;
 pub use plugins::plugins_manager_for_config;
+pub mod patch_runtime;
 #[doc(hidden)]
 pub(crate) mod prompt_debug;
 #[doc(hidden)]
@@ -191,6 +192,7 @@ pub use client::X_CODEX_TURN_METADATA_HEADER;
 pub use client_common::Prompt;
 pub use client_common::ResponseEvent;
 pub use client_common::ResponseStream;
+pub use codex_api::RawResponseSink;
 pub use codex_prompts::REVIEW_PROMPT;
 pub use compact::content_items_to_text;
 pub use current_time::SleepFuture;
