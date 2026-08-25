@@ -13,6 +13,8 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider::create_model_provider;
+use codex_models_manager::manager::ModelCatalogProvenance;
+use codex_models_manager::manager::ModelCatalogResolution;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
@@ -21,6 +23,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionSource;
 
@@ -66,10 +69,12 @@ pub struct PatchRuntimeStream {
 
 /// Resolve normal Codex runtime state and make exactly one strict full-input WebSocket request.
 ///
-/// Configuration and authentication are loaded lazily inside this invocation. The model catalog is
-/// refreshed with authenticated normal provider behavior and the requested slug must be present as
-/// an exact effective catalog entry; bundled/fallback model metadata is rejected. Only Responses
-/// Lite models on WebSocket-capable Responses providers are accepted.
+/// Configuration and authentication are loaded lazily inside this invocation. The model catalog
+/// uses Codex's normal cache-aware refresh behavior: only a fresh authenticated remote catalog or
+/// Codex's still-valid version-matched cache is accepted as capability evidence. The requested
+/// slug must be present as an exact effective catalog entry; bundled, configured, and fallback
+/// metadata is rejected. Only Responses Lite models on WebSocket-capable Responses providers are
+/// accepted.
 pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<PatchRuntimeStream> {
     let config = ConfigBuilder::default()
         .codex_home(request.codex_home)
@@ -114,60 +119,36 @@ pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<P
 
     if config.model_catalog.is_some() {
         return Err(CodexErr::InvalidRequest(
-            "Patch runtime requires a remotely refreshed authenticated model catalog".to_string(),
+            "Patch runtime does not accept configured static model metadata as capability evidence"
+                .to_string(),
         ));
     }
 
     let provider = create_model_provider(provider_info.clone(), Some(Arc::clone(&auth_manager)));
-    let models_manager = provider.models_manager_without_cache(config.model_catalog.clone());
+    let models_manager = provider.models_manager(
+        config.codex_home.to_path_buf(),
+        config.model_catalog.clone(),
+    );
     let catalog = models_manager
-        .raw_model_catalog_strict(RefreshStrategy::Online, config.http_client_factory())
+        .raw_model_catalog_with_provenance(
+            RefreshStrategy::OnlineIfUncached,
+            config.http_client_factory(),
+        )
         .await
         .map_err(|err| {
             CodexErr::Fatal(format!(
-                "failed to refresh the effective authenticated model catalog: {err}"
+                "failed to resolve the effective authenticated model catalog: {err}"
             ))
         })?;
-    let capability_revision = serde_json::to_vec(&catalog.models)
+    let capability_revision = serde_json::to_vec(&catalog.catalog.models)
         .map(|catalog| digest_compatibility_value("catalog", &catalog))
         .map_err(|err| {
             CodexErr::Fatal(format!(
                 "failed to serialize effective model catalog: {err}"
             ))
         })?;
-    let model_info = catalog
-        .models
-        .into_iter()
-        .find(|candidate| candidate.slug == request.model)
-        .ok_or_else(|| {
-            CodexErr::InvalidRequest(format!(
-                "requested model `{}` is not present in the effective authenticated catalog",
-                request.model
-            ))
-        })?;
-    if model_info.used_fallback_model_metadata {
-        return Err(CodexErr::InvalidRequest(format!(
-            "requested model `{}` resolved to fallback metadata",
-            request.model
-        )));
-    }
-    if !model_info.supported_in_api || !model_info.use_responses_lite {
-        return Err(CodexErr::UnsupportedOperation(format!(
-            "requested model `{}` does not support Responses Lite",
-            request.model
-        )));
-    }
-    if let Some(effort) = request.effort.as_ref()
-        && !model_info
-            .supported_reasoning_levels
-            .iter()
-            .any(|preset| preset.effort == *effort)
-    {
-        return Err(CodexErr::InvalidRequest(format!(
-            "requested reasoning effort is not supported by the effective model `{}`",
-            request.model
-        )));
-    }
+    let model_info =
+        validate_patch_model_catalog(catalog, &request.model, request.effort.as_ref())?;
 
     let thread_id = ThreadId::new();
     let installation_id = resolve_installation_id(&config.codex_home)
@@ -232,6 +213,50 @@ pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<P
     })
 }
 
+fn validate_patch_model_catalog(
+    resolution: ModelCatalogResolution,
+    requested_model: &str,
+    effort: Option<&ReasoningEffort>,
+) -> Result<ModelInfo> {
+    if resolution.provenance == ModelCatalogProvenance::Untrusted {
+        return Err(CodexErr::InvalidRequest(
+            "Patch runtime requires fresh official model metadata or a valid official Codex cache"
+                .to_string(),
+        ));
+    }
+    let model_info = resolution
+        .catalog
+        .models
+        .into_iter()
+        .find(|candidate| candidate.slug == requested_model)
+        .ok_or_else(|| {
+            CodexErr::InvalidRequest(format!(
+                "requested model `{requested_model}` is not present in the trusted effective catalog"
+            ))
+        })?;
+    if model_info.used_fallback_model_metadata {
+        return Err(CodexErr::InvalidRequest(format!(
+            "requested model `{requested_model}` resolved to fallback metadata"
+        )));
+    }
+    if !model_info.supported_in_api || !model_info.use_responses_lite {
+        return Err(CodexErr::UnsupportedOperation(format!(
+            "requested model `{requested_model}` does not support Responses Lite"
+        )));
+    }
+    if let Some(effort) = effort
+        && !model_info
+            .supported_reasoning_levels
+            .iter()
+            .any(|preset| preset.effort == *effort)
+    {
+        return Err(CodexErr::InvalidRequest(format!(
+            "requested reasoning effort is not supported by the effective model `{requested_model}`"
+        )));
+    }
+    Ok(model_info)
+}
+
 pub(crate) fn digest_compatibility_value(domain: &str, value: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain.as_bytes());
@@ -239,4 +264,128 @@ pub(crate) fn digest_compatibility_value(domain: &str, value: &[u8]) -> String {
     hasher.update(value);
     let digest = hasher.finalize();
     format!("sha256:{digest:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::openai_models::ModelsResponse;
+    use serde_json::json;
+
+    fn sol_model() -> ModelInfo {
+        serde_json::from_value(json!({
+            "slug": "gpt-5.6-sol",
+            "display_name": "Sol",
+            "description": "fixture",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                {"effort": "low", "description": "low"},
+                {"effort": "medium", "description": "medium"}
+            ],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 0,
+            "upgrade": null,
+            "model_messages": null,
+            "support_verbosity": false,
+            "default_verbosity": null,
+            "apply_patch_tool_type": null,
+            "truncation_policy": {"mode": "bytes", "limit": 10000},
+            "supports_image_detail_original": false,
+            "context_window": 272000,
+            "max_context_window": 272000,
+            "experimental_supported_tools": [],
+            "use_responses_lite": true
+        }))
+        .expect("valid Sol fixture")
+    }
+
+    fn resolution(provenance: ModelCatalogProvenance, model: ModelInfo) -> ModelCatalogResolution {
+        ModelCatalogResolution {
+            catalog: ModelsResponse {
+                models: vec![model],
+            },
+            provenance,
+        }
+    }
+
+    #[test]
+    fn accepts_fresh_official_remote_catalog() {
+        let model = validate_patch_model_catalog(
+            resolution(ModelCatalogProvenance::FreshRemote, sol_model()),
+            "gpt-5.6-sol",
+            Some(&ReasoningEffort::Medium),
+        )
+        .expect("fresh authenticated catalog is accepted");
+
+        assert_eq!(model.slug, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn accepts_valid_official_cached_catalog() {
+        let model = validate_patch_model_catalog(
+            resolution(ModelCatalogProvenance::ValidCache, sol_model()),
+            "gpt-5.6-sol",
+            Some(&ReasoningEffort::Low),
+        )
+        .expect("Codex-validated catalog cache is accepted");
+
+        assert!(model.use_responses_lite);
+    }
+
+    #[test]
+    fn rejects_untrusted_catalog_metadata() {
+        let error = validate_patch_model_catalog(
+            resolution(ModelCatalogProvenance::Untrusted, sol_model()),
+            "gpt-5.6-sol",
+            None,
+        )
+        .expect_err("bundled, configured, and fallback metadata is not production evidence");
+
+        assert!(error.to_string().contains("fresh official model metadata"));
+    }
+
+    #[test]
+    fn rejects_unsupported_reasoning_effort_before_dispatch() {
+        let error = validate_patch_model_catalog(
+            resolution(ModelCatalogProvenance::FreshRemote, sol_model()),
+            "gpt-5.6-sol",
+            Some(&ReasoningEffort::High),
+        )
+        .expect_err("unsupported effort must not reach dispatch");
+
+        assert!(error.to_string().contains("reasoning effort"));
+    }
+
+    #[test]
+    fn retains_exact_model_and_responses_lite_checks() {
+        let missing_model = validate_patch_model_catalog(
+            resolution(ModelCatalogProvenance::FreshRemote, sol_model()),
+            "gpt-5.6-sol-other",
+            None,
+        )
+        .expect_err("effective model slug must match exactly");
+        assert!(missing_model.to_string().contains("not present"));
+
+        let mut no_lite = sol_model();
+        no_lite.use_responses_lite = false;
+        let error = validate_patch_model_catalog(
+            resolution(ModelCatalogProvenance::FreshRemote, no_lite),
+            "gpt-5.6-sol",
+            None,
+        )
+        .expect_err("Responses Lite remains mandatory");
+        assert!(error.to_string().contains("Responses Lite"));
+
+        let mut fallback = sol_model();
+        fallback.used_fallback_model_metadata = true;
+        let error = validate_patch_model_catalog(
+            resolution(ModelCatalogProvenance::FreshRemote, fallback),
+            "gpt-5.6-sol",
+            None,
+        )
+        .expect_err("fallback metadata remains rejected");
+        assert!(error.to_string().contains("fallback metadata"));
+    }
 }

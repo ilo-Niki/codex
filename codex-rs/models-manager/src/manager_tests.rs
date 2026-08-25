@@ -258,6 +258,31 @@ impl ExternalAuth for TestUnresolvedExternalApiKeyAuth {
     }
 }
 
+#[derive(Debug)]
+struct FailingModelsEndpoint;
+
+impl ModelsEndpointClient for FailingModelsEndpoint {
+    fn has_command_auth(&self) -> bool {
+        true
+    }
+
+    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        Box::pin(async { true })
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        _client_version: &'a str,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+        Box::pin(async {
+            Err(codex_protocol::error::CodexErr::Fatal(
+                "fixture remote catalog unavailable".to_string(),
+            ))
+        })
+    }
+}
+
 impl ModelsEndpointClient for TestModelsEndpoint {
     fn has_command_auth(&self) -> bool {
         self.has_command_auth
@@ -321,6 +346,23 @@ where
 
 fn static_manager_for_tests(model_catalog: ModelsResponse) -> StaticModelsManager {
     StaticModelsManager::new(/*auth_manager*/ None, model_catalog)
+}
+
+#[tokio::test]
+async fn static_catalog_is_untrusted_for_execution_capabilities() {
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![remote_model("static", "Static", /*priority*/ 0)],
+    });
+
+    let resolution = manager
+        .raw_model_catalog_with_provenance(
+            RefreshStrategy::OnlineIfUncached,
+            DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("static catalog resolves as untrusted");
+
+    assert_eq!(resolution.provenance, ModelCatalogProvenance::Untrusted);
 }
 
 #[tokio::test]
@@ -458,6 +500,121 @@ async fn injected_cache_hit_avoids_remote_fetch() {
 
     assert_eq!(catalog.models, cached_models);
     assert_eq!(endpoint.fetch_count(), 0);
+}
+
+#[tokio::test]
+async fn provenance_resolution_accepts_fresh_remote_catalog() {
+    let remote_models = vec![remote_model_with_visibility(
+        "remote", "Remote", /*priority*/ 0, "hide",
+    )];
+    let manager = OpenAiModelsManager::new_with_cache(
+        TestModelsCache::failing(/*load_error*/ false, /*store_error*/ false),
+        TestModelsEndpoint::new(vec![remote_models.clone()]),
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+    );
+
+    let resolution = manager
+        .raw_model_catalog_with_provenance(
+            RefreshStrategy::OnlineIfUncached,
+            DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("remote fixture resolves");
+
+    assert_eq!(resolution.provenance, ModelCatalogProvenance::FreshRemote);
+    assert_eq!(resolution.catalog.models, remote_models);
+}
+
+#[tokio::test]
+async fn provenance_resolution_accepts_valid_cache_without_remote_refresh() {
+    let cached_models = vec![remote_model_with_visibility(
+        "cached", "Cached", /*priority*/ 0, "hide",
+    )];
+    let endpoint = TestModelsEndpoint::new(Vec::new());
+    let manager = OpenAiModelsManager::new_with_cache(
+        TestModelsCache::with_entry(ModelsCacheEntry {
+            fetched_at: Utc::now(),
+            etag: Some("cached-etag".to_string()),
+            client_version: Some(crate::client_version_to_whole()),
+            models: cached_models.clone(),
+        }),
+        endpoint.clone(),
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+    );
+
+    let resolution = manager
+        .raw_model_catalog_with_provenance(
+            RefreshStrategy::OnlineIfUncached,
+            DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect("valid cache resolves");
+
+    assert_eq!(resolution.provenance, ModelCatalogProvenance::ValidCache);
+    assert_eq!(resolution.catalog.models, cached_models);
+    assert_eq!(
+        endpoint.fetch_count(),
+        0,
+        "valid cache avoids mandatory refresh"
+    );
+}
+
+#[tokio::test]
+async fn provenance_resolution_rejects_stale_or_version_mismatched_cache_when_refresh_fails() {
+    let codex_home = tempdir().expect("temp dir");
+    let stale_cache = Arc::new(FileModelsCache::new(
+        codex_home.path().join(MODEL_CACHE_FILE),
+        DEFAULT_MODEL_CACHE_TTL,
+    ));
+    stale_cache
+        .store(&ModelsCacheEntry {
+            fetched_at: Utc::now() - chrono::Duration::hours(1),
+            etag: Some("stale-etag".to_string()),
+            client_version: Some(crate::client_version_to_whole()),
+            models: vec![remote_model("stale", "Stale", /*priority*/ 0)],
+        })
+        .await
+        .expect("store stale fixture");
+    let stale_manager = OpenAiModelsManager::new_with_cache(
+        stale_cache,
+        Arc::new(FailingModelsEndpoint),
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+    );
+    let stale_error = stale_manager
+        .raw_model_catalog_with_provenance(
+            RefreshStrategy::OnlineIfUncached,
+            DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect_err("expired cache must not fall back to bundled metadata");
+    assert!(stale_error.to_string().contains("catalog unavailable"));
+
+    let version_mismatched_manager = OpenAiModelsManager::new_with_cache(
+        TestModelsCache::with_entry(ModelsCacheEntry {
+            fetched_at: Utc::now(),
+            etag: Some("old-version-etag".to_string()),
+            client_version: Some("incompatible-client-version".to_string()),
+            models: vec![remote_model("old", "Old", /*priority*/ 0)],
+        }),
+        Arc::new(FailingModelsEndpoint),
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
+    );
+    let version_error = version_mismatched_manager
+        .raw_model_catalog_with_provenance(
+            RefreshStrategy::OnlineIfUncached,
+            DEFAULT_HTTP_CLIENT_FACTORY,
+        )
+        .await
+        .expect_err("version-mismatched cache must not fall back to bundled metadata");
+    assert!(version_error.to_string().contains("catalog unavailable"));
 }
 
 #[tokio::test]

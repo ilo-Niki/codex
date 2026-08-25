@@ -78,6 +78,27 @@ impl fmt::Display for RefreshStrategy {
     }
 }
 
+/// Evidence source for an effective model catalog.
+///
+/// Only a fresh authenticated remote catalog or a cache entry that Codex itself
+/// accepted for the current client version and TTL is suitable for execution
+/// capability checks. Bundled, configured, and fallback metadata is explicitly
+/// marked untrusted for that purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCatalogProvenance {
+    FreshRemote,
+    ValidCache,
+    Untrusted,
+}
+
+/// Raw model catalog paired with the minimum evidence needed for execution
+/// capability checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCatalogResolution {
+    pub catalog: ModelsResponse,
+    pub provenance: ModelCatalogProvenance,
+}
+
 type SharedModelsEndpointClient = Arc<dyn ModelsEndpointClient>;
 
 /// Coordinates model discovery plus cached metadata on disk.
@@ -124,6 +145,26 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
             Ok(self
                 .raw_model_catalog(refresh_strategy, http_client_factory)
                 .await)
+        })
+    }
+
+    /// Resolve a raw catalog with the evidence needed by an execution boundary.
+    ///
+    /// The default deliberately treats static, bundled, and fallback-tolerant
+    /// catalogs as untrusted. Remote providers override this to report whether
+    /// the normal cache-aware resolution used a fresh catalog or a valid cache.
+    fn raw_model_catalog_with_provenance(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, CoreResult<ModelCatalogResolution>> {
+        Box::pin(async move {
+            Ok(ModelCatalogResolution {
+                catalog: self
+                    .raw_model_catalog(refresh_strategy, http_client_factory)
+                    .await,
+                provenance: ModelCatalogProvenance::Untrusted,
+            })
         })
     }
 
@@ -343,6 +384,18 @@ impl ModelsManager for OpenAiModelsManager {
         })
     }
 
+    fn raw_model_catalog_with_provenance(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, CoreResult<ModelCatalogResolution>> {
+        Box::pin(OpenAiModelsManager::raw_model_catalog_with_provenance(
+            self,
+            refresh_strategy,
+            http_client_factory,
+        ))
+    }
+
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
         Box::pin(async move { self.remote_models.read().await.clone() })
     }
@@ -389,6 +442,59 @@ impl OpenAiModelsManager {
         }
     }
 
+    async fn raw_model_catalog_with_provenance(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: HttpClientFactory,
+    ) -> CoreResult<ModelCatalogResolution> {
+        match refresh_strategy {
+            RefreshStrategy::Offline => {
+                if let Some(entry) = self.try_load_cache().await {
+                    return Ok(ModelCatalogResolution {
+                        catalog: ModelsResponse {
+                            models: entry.models,
+                        },
+                        provenance: ModelCatalogProvenance::ValidCache,
+                    });
+                }
+            }
+            RefreshStrategy::OnlineIfUncached => {
+                if let Some(entry) = self.try_load_cache().await {
+                    info!("models cache: using cached models for OnlineIfUncached");
+                    return Ok(ModelCatalogResolution {
+                        catalog: ModelsResponse {
+                            models: entry.models,
+                        },
+                        provenance: ModelCatalogProvenance::ValidCache,
+                    });
+                }
+                if self.should_refresh_models().await {
+                    let models = self.fetch_and_update_models(&http_client_factory).await?;
+                    return Ok(ModelCatalogResolution {
+                        catalog: ModelsResponse { models },
+                        provenance: ModelCatalogProvenance::FreshRemote,
+                    });
+                }
+            }
+            RefreshStrategy::Online => {
+                if self.should_refresh_models().await {
+                    let models = self.fetch_and_update_models(&http_client_factory).await?;
+                    return Ok(ModelCatalogResolution {
+                        catalog: ModelsResponse { models },
+                        provenance: ModelCatalogProvenance::FreshRemote,
+                    });
+                }
+            }
+        }
+
+        Ok(ModelCatalogResolution {
+            catalog: ModelsResponse {
+                models: self.get_remote_models().await,
+            },
+            provenance: ModelCatalogProvenance::Untrusted,
+        })
+    }
+
     async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
         let current_etag = self.get_etag().await;
         if current_etag.clone().is_some() && current_etag.as_deref() == Some(etag.as_str()) {
@@ -431,16 +537,20 @@ impl OpenAiModelsManager {
             }
             RefreshStrategy::OnlineIfUncached => {
                 // Try cache first, fall back to online if unavailable
-                if self.try_load_cache().await {
+                if self.try_load_cache().await.is_some() {
                     info!("models cache: using cached models for OnlineIfUncached");
                     return Ok(());
                 }
                 info!("models cache: cache miss, fetching remote models");
-                self.fetch_and_update_models(http_client_factory).await
+                self.fetch_and_update_models(http_client_factory)
+                    .await
+                    .map(|_| ())
             }
             RefreshStrategy::Online => {
                 // Always fetch from network
-                self.fetch_and_update_models(http_client_factory).await
+                self.fetch_and_update_models(http_client_factory)
+                    .await
+                    .map(|_| ())
             }
         }
     }
@@ -448,7 +558,7 @@ impl OpenAiModelsManager {
     async fn fetch_and_update_models(
         &self,
         http_client_factory: &HttpClientFactory,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<Vec<ModelInfo>> {
         let client_version = crate::client_version_to_whole();
         let (models, etag) = self
             .endpoint_client
@@ -461,13 +571,13 @@ impl OpenAiModelsManager {
                 fetched_at: Utc::now(),
                 etag,
                 client_version: Some(client_version),
-                models,
+                models: models.clone(),
             };
             if let Err(err) = cache.store(&entry).await {
                 error!("failed to write models cache: {err}");
             }
         }
-        Ok(())
+        Ok(models)
     }
 
     async fn should_refresh_models(&self) -> bool {
@@ -511,9 +621,9 @@ impl OpenAiModelsManager {
     }
 
     /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
-    async fn try_load_cache(&self) -> bool {
+    async fn try_load_cache(&self) -> Option<ModelsCacheEntry> {
         let Some(cache) = self.cache.as_ref() else {
-            return false;
+            return None;
         };
         let _timer =
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
@@ -525,11 +635,11 @@ impl OpenAiModelsManager {
             Ok(Some(cache_entry)) => cache_entry,
             Ok(None) => {
                 info!("models cache: no usable cache entry");
-                return false;
+                return None;
             }
             Err(err) => {
                 error!("failed to load models cache: {err}");
-                return false;
+                return None;
             }
         };
         if cache_entry.client_version.as_deref() != Some(client_version.as_str()) {
@@ -538,7 +648,7 @@ impl OpenAiModelsManager {
                 cached_version = ?cache_entry.client_version,
                 "models cache: cache version mismatch"
             );
-            return false;
+            return None;
         }
         let models = cache_entry.models.clone();
         *self.etag.write().await = cache_entry.etag.clone();
@@ -548,7 +658,7 @@ impl OpenAiModelsManager {
             etag = ?cache_entry.etag,
             "models cache: cache entry applied"
         );
-        true
+        Some(cache_entry)
     }
 }
 
