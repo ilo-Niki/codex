@@ -329,11 +329,17 @@ impl ModelsManager for OpenAiModelsManager {
         http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, CoreResult<ModelsResponse>> {
         Box::pin(async move {
-            self.refresh_available_models(refresh_strategy, &http_client_factory)
+            if !matches!(refresh_strategy, RefreshStrategy::Online) {
+                return Ok(ModelsResponse {
+                    models: self.get_remote_models().await,
+                });
+            }
+            let client_version = crate::client_version_to_whole();
+            let (models, _etag) = self
+                .endpoint_client
+                .list_models(&client_version, http_client_factory)
                 .await?;
-            Ok(ModelsResponse {
-                models: self.get_remote_models().await,
-            })
+            Ok(ModelsResponse { models })
         })
     }
 
