@@ -7,7 +7,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 use codex_login::AuthManager;
+use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider::create_model_provider;
 use codex_models_manager::manager::RefreshStrategy;
@@ -54,13 +57,20 @@ pub struct PatchRuntimeRequest {
     pub raw_sink: Arc<dyn codex_api::RawResponseSink>,
 }
 
+/// The stream and the authenticated compatibility metadata that produced it.
+pub struct PatchRuntimeStream {
+    pub stream: ResponseStream,
+    pub auth_profile_scope: String,
+    pub capability_revision: String,
+}
+
 /// Resolve normal Codex runtime state and make exactly one strict full-input WebSocket request.
 ///
 /// Configuration and authentication are loaded lazily inside this invocation. The model catalog is
 /// refreshed with authenticated normal provider behavior and the requested slug must be present as
 /// an exact effective catalog entry; bundled/fallback model metadata is rejected. Only Responses
 /// Lite models on WebSocket-capable Responses providers are accepted.
-pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<ResponseStream> {
+pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<PatchRuntimeStream> {
     let config = ConfigBuilder::default()
         .codex_home(request.codex_home)
         .build()
@@ -72,9 +82,8 @@ pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<R
             .await
             .map_err(|err| CodexErr::Fatal(format!("failed to initialize Codex auth: {err}")))?;
 
-    // Loading auth here makes the persisted-auth refresh path part of catalog resolution while
-    // retaining support for providers whose credentials come from their configured environment.
-    let _ = auth_manager.auth().await;
+    // Loading auth here makes the persisted-auth refresh path part of catalog resolution.
+    let auth = auth_manager.auth().await;
 
     let provider_info = config.model_provider.clone();
     if provider_info.wire_api != codex_model_provider_info::WireApi::Responses {
@@ -87,12 +96,45 @@ pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<R
             "Patch runtime requires a WebSocket-capable provider".to_string(),
         ));
     }
+    if !provider_info.is_openai() || !provider_info.requires_openai_auth {
+        return Err(CodexErr::UnsupportedOperation(
+            "Patch runtime requires the first-party OpenAI provider".to_string(),
+        ));
+    }
+    let auth_profile_scope = auth
+        .as_ref()
+        .filter(|auth| auth.uses_codex_backend())
+        .and_then(CodexAuth::get_account_id)
+        .map(|account_id| digest_compatibility_value("chatgpt-account", account_id.as_bytes()))
+        .ok_or_else(|| {
+            CodexErr::InvalidRequest(
+                "Patch runtime requires authenticated ChatGPT account scope".to_string(),
+            )
+        })?;
+
+    if config.model_catalog.is_some() {
+        return Err(CodexErr::InvalidRequest(
+            "Patch runtime requires a remotely refreshed authenticated model catalog".to_string(),
+        ));
+    }
 
     let provider = create_model_provider(provider_info.clone(), Some(Arc::clone(&auth_manager)));
     let models_manager = provider.models_manager_without_cache(config.model_catalog.clone());
     let catalog = models_manager
-        .raw_model_catalog(RefreshStrategy::Online, config.http_client_factory())
-        .await;
+        .raw_model_catalog_strict(RefreshStrategy::Online, config.http_client_factory())
+        .await
+        .map_err(|err| {
+            CodexErr::Fatal(format!(
+                "failed to refresh the effective authenticated model catalog: {err}"
+            ))
+        })?;
+    let capability_revision = serde_json::to_vec(&catalog.models)
+        .map(|catalog| digest_compatibility_value("catalog", &catalog))
+        .map_err(|err| {
+            CodexErr::Fatal(format!(
+                "failed to serialize effective model catalog: {err}"
+            ))
+        })?;
     let model_info = catalog
         .models
         .into_iter()
@@ -115,6 +157,25 @@ pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<R
             request.model
         )));
     }
+    if let Some(effort) = request.effort.as_ref()
+        && !model_info
+            .supported_reasoning_levels
+            .iter()
+            .any(|preset| preset.effort == *effort)
+    {
+        return Err(CodexErr::InvalidRequest(format!(
+            "requested reasoning effort is not supported by the effective model `{}`",
+            request.model
+        )));
+    }
+
+    request
+        .raw_sink
+        .record_runtime_compatibility(&auth_profile_scope, &capability_revision)
+        .await
+        .map_err(|err| {
+            CodexErr::Fatal(format!("failed to bind Patch runtime compatibility: {err}"))
+        })?;
 
     let thread_id = ThreadId::new();
     let installation_id = resolve_installation_id(&config.codex_home)
@@ -157,7 +218,7 @@ pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<R
         config.http_client_factory(),
     );
     let prompt = Prompt::new_no_tools(request.input, request.base_instructions);
-    client
+    let stream = client
         .new_fresh_session()
         .stream_full_input_websocket_once_with_raw_sink(
             &prompt,
@@ -169,5 +230,19 @@ pub async fn stream_patch_runtime_once(request: PatchRuntimeRequest) -> Result<R
             &responses_metadata,
             request.raw_sink,
         )
-        .await
+        .await?;
+    Ok(PatchRuntimeStream {
+        stream,
+        auth_profile_scope,
+        capability_revision,
+    })
+}
+
+fn digest_compatibility_value(domain: &str, value: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(domain.as_bytes());
+    hasher.update([0]);
+    hasher.update(value);
+    let digest = hasher.finalize();
+    format!("sha256:{digest:x}")
 }

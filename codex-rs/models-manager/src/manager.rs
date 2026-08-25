@@ -111,6 +111,22 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
         http_client_factory: HttpClientFactory,
     ) -> ModelsManagerFuture<'_, ModelsResponse>;
 
+    /// Return a raw catalog while propagating a required refresh failure.
+    ///
+    /// The default retains the normal fallback-tolerant behavior. Providers
+    /// with a remote authoritative catalog override this for strict callers.
+    fn raw_model_catalog_strict(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, CoreResult<ModelsResponse>> {
+        Box::pin(async move {
+            Ok(self
+                .raw_model_catalog(refresh_strategy, http_client_factory)
+                .await)
+        })
+    }
+
     /// Return the current in-memory remote model catalog without refreshing or loading cache state.
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>>;
 
@@ -305,6 +321,20 @@ impl ModelsManager for OpenAiModelsManager {
             refresh_strategy,
             http_client_factory,
         ))
+    }
+
+    fn raw_model_catalog_strict(
+        &self,
+        refresh_strategy: RefreshStrategy,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsManagerFuture<'_, CoreResult<ModelsResponse>> {
+        Box::pin(async move {
+            self.refresh_available_models(refresh_strategy, &http_client_factory)
+                .await?;
+            Ok(ModelsResponse {
+                models: self.get_remote_models().await,
+            })
+        })
     }
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {

@@ -59,6 +59,15 @@ pub trait RawResponseSink: Send + Sync {
         items: Vec<Box<RawValue>>,
     ) -> BoxFuture<'a, Result<(), ApiError>>;
 
+    /// Binds authenticated runtime compatibility before a request can dispatch.
+    fn record_runtime_compatibility<'a>(
+        &'a self,
+        _auth_profile_scope: &'a str,
+        _capability_revision: &'a str,
+    ) -> BoxFuture<'a, Result<(), ApiError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn record_completed_output_item<'a>(
         &'a self,
         item: Box<RawValue>,
@@ -71,6 +80,13 @@ pub trait RawResponseSink: Send + Sync {
     fn authorize_transport_dispatch<'a>(&'a self) -> BoxFuture<'a, Result<(), ApiError>> {
         Box::pin(async { Ok(()) })
     }
+
+    /// Transfers the one-shot cancellation signal to the WebSocket send seam.
+    /// The caller races it against the actual socket write, favoring
+    /// cancellation when both become ready together.
+    fn take_transport_cancellation(&self) -> Option<BoxFuture<'static, ()>> {
+        None
+    }
 }
 
 struct WsStream {
@@ -82,6 +98,7 @@ struct WsStream {
 enum WsCommand {
     Send {
         message: Message,
+        cancellation: Option<BoxFuture<'static, ()>>,
         tx_result: oneshot::Sender<Result<(), WsError>>,
     },
 }
@@ -100,8 +117,20 @@ impl WsStream {
                             break;
                         };
                         match command {
-                            WsCommand::Send { message, tx_result } => {
-                                let result = inner.send(message).await;
+                            WsCommand::Send {
+                                message,
+                                cancellation,
+                                tx_result,
+                            } => {
+                                let result = if let Some(cancelled) = cancellation {
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancelled => Err(WsError::ConnectionClosed),
+                                        result = inner.send(message) => result,
+                                    }
+                                } else {
+                                    inner.send(message).await
+                                };
                                 let should_break = result.is_err();
                                 let _ = tx_result.send(result);
                                 if should_break {
@@ -162,9 +191,17 @@ impl WsStream {
         rx_result.await.unwrap_or(Err(WsError::ConnectionClosed))
     }
 
-    async fn send(&self, message: Message) -> Result<(), WsError> {
-        self.request(|tx_result| WsCommand::Send { message, tx_result })
-            .await
+    async fn send_cancellable(
+        &self,
+        message: Message,
+        cancellation: Option<BoxFuture<'static, ()>>,
+    ) -> Result<(), WsError> {
+        self.request(|tx_result| WsCommand::Send {
+            message,
+            cancellation,
+            tx_result,
+        })
+        .await
     }
 
     async fn next(&mut self) -> Option<Result<Message, WsError>> {
@@ -723,15 +760,19 @@ async fn run_websocket_response_stream(
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
-    if let Some(raw_sink) = raw_sink {
+    let cancellation = if let Some(raw_sink) = raw_sink {
         raw_sink.authorize_transport_dispatch().await?;
-    }
+        raw_sink.take_transport_cancellation()
+    } else {
+        None
+    };
     send_websocket_request(
         ws_stream,
         request_text,
         idle_timeout,
         telemetry.as_ref(),
         timing_log_context.connection_reused,
+        cancellation,
     )
     .await?;
 
@@ -930,11 +971,12 @@ async fn send_websocket_request(
     idle_timeout: Duration,
     telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
     connection_reused: bool,
+    cancellation: Option<BoxFuture<'static, ()>>,
 ) -> Result<(), ApiError> {
     let request_start = Instant::now();
     let result = tokio::time::timeout(
         idle_timeout,
-        ws_stream.send(Message::Text(request_text.into())),
+        ws_stream.send_cancellable(Message::Text(request_text.into()), cancellation),
     )
     .await
     .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
@@ -987,10 +1029,9 @@ fn raw_request_input_items(request_text: &str) -> Result<Vec<Box<RawValue>>, Api
 }
 
 fn raw_completed_output_item(text: &str) -> Result<Option<Box<RawValue>>, ApiError> {
-    let event: RawWebsocketEvent<'_> = match serde_json::from_str(text) {
-        Ok(event) => event,
-        Err(_) => return Ok(None),
-    };
+    let event: RawWebsocketEvent<'_> = serde_json::from_str(text).map_err(|error| {
+        ApiError::Stream(format!("failed to inspect raw websocket event: {error}"))
+    })?;
     if event.kind != "response.output_item.done" {
         return Ok(None);
     }
@@ -1035,6 +1076,13 @@ mod tests {
         assert_eq!(
             raw_completed_output_item(output).unwrap().unwrap().get(),
             r#"{"type":"reasoning","encrypted_content":"opaque","future":[1,2]}"#
+        );
+    }
+
+    #[test]
+    fn raw_item_extractor_rejects_malformed_frame() {
+        assert!(
+            raw_completed_output_item(r#"{"type":"response.output_item.done","item":"#).is_err()
         );
     }
 
