@@ -501,6 +501,15 @@ impl PatchRuntime {
         }
     }
 
+    /// Returns the nonsecret compatibility envelope bound at runtime construction.
+    /// Callers use it only to reject incompatible opaque checkpoint custody.
+    pub fn compatibility_envelope(&self) -> (&str, &str) {
+        (
+            &self.inner.auth_profile_scope,
+            &self.inner.capability_revision,
+        )
+    }
+
     /// Creates a fresh turn session while retaining the process-local client owner.
     pub fn new_turn(&self, request: PatchRuntimeTurnRequest) -> PatchRuntimeTurn {
         PatchRuntimeTurn {
