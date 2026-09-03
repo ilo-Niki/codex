@@ -9,11 +9,15 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 
+use futures::StreamExt;
+use futures::future::BoxFuture;
 use serde_json::value::RawValue;
 use sha2::Digest;
 use sha2::Sha256;
 
+use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
@@ -33,6 +37,12 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout_trace::InferenceTraceContext;
+
+use crate::client_common::ResponseEvent;
+use crate::compact_remote::should_keep_compacted_history_item;
+use crate::compact_remote_v2::RETAINED_MESSAGE_TOKEN_BUDGET;
+use crate::compact_remote_v2::is_retained_for_remote_compaction_v2;
+use crate::context_manager::estimate_item_token_count;
 
 use crate::ModelClient;
 use crate::Prompt;
@@ -296,6 +306,26 @@ pub struct PatchRuntimeTurnRequest {
     pub raw_sink: Arc<dyn codex_api::RawResponseSink>,
 }
 
+/// Exact native state on which Codex may run Remote Compaction V2.
+///
+/// The facade reads the items only to apply Codex's maintained V2 retention rules. It returns
+/// selected source values and the provider-produced compaction item as their original raw JSON;
+/// it never serializes a typed response item back into Patch custody.
+pub struct PatchRuntimeCompactionRequest {
+    pub history: Vec<Box<RawValue>>,
+    pub base_instructions: BaseInstructions,
+    pub summary: ReasoningSummary,
+    pub session_id: String,
+    pub turn_id: String,
+}
+
+/// A lossless V2 replacement history suitable for a successor native checkpoint.
+pub struct PatchRuntimeCompactionResult {
+    pub retained_history: Vec<Box<RawValue>>,
+    pub compaction_output: Box<RawValue>,
+    pub route: PatchRuntimeRoute,
+}
+
 /// One fresh ModelClientSession. Construct one per Patch logical turn.
 pub struct PatchRuntimeTurn {
     runtime: Arc<PatchRuntimeInner>,
@@ -314,6 +344,7 @@ struct PatchRuntimeInner {
     installation_id: String,
     auth_profile_scope: String,
     capability_revision: String,
+    remote_compaction_v2_enabled: bool,
 }
 
 /// Long-lived process-local Patch runtime owner.
@@ -390,6 +421,8 @@ impl PatchRuntime {
                 ))
             })?;
         let model_info = validate_patch_model_catalog(catalog, &model, effort.as_ref())?;
+        let remote_compaction_v2_enabled =
+            provider_info.is_openai() && config_state.features.enabled(Feature::RemoteCompactionV2);
         let thread_id = ThreadId::new();
         let installation_id = resolve_installation_id(&config_state.codex_home)
             .await
@@ -423,6 +456,7 @@ impl PatchRuntime {
                 installation_id,
                 auth_profile_scope,
                 capability_revision,
+                remote_compaction_v2_enabled,
             }),
         })
     }
@@ -444,6 +478,13 @@ impl PatchRuntime {
         if config.model_catalog.is_some() {
             return Ok(PatchRuntimeCompatibility::Incompatible(
                 "configured model metadata became active".to_string(),
+            ));
+        }
+        let remote_compaction_v2_enabled = config.model_provider.is_openai()
+            && config.features.enabled(Feature::RemoteCompactionV2);
+        if remote_compaction_v2_enabled != self.inner.remote_compaction_v2_enabled {
+            return Ok(PatchRuntimeCompatibility::Incompatible(
+                "Remote Compaction V2 availability changed".to_string(),
             ));
         }
         let auth_manager =
@@ -510,6 +551,128 @@ impl PatchRuntime {
         )
     }
 
+    /// Whether the effective model's own automatic-compaction limit considers the last native
+    /// context full. Patch supplies the provider-reported input usage; it does not estimate or
+    /// configure a threshold.
+    pub fn remote_compaction_v2_is_due(&self, active_context_tokens: Option<i64>) -> bool {
+        self.inner.remote_compaction_v2_enabled
+            && active_context_tokens.is_some_and(|active_context_tokens| {
+                self.inner
+                    .model_info
+                    .auto_compact_token_limit()
+                    .is_some_and(|limit| active_context_tokens >= limit)
+            })
+    }
+
+    /// Runs one maintained Remote Compaction V2 request over exact native history.
+    ///
+    /// This path intentionally opens a fresh full-input request: V2 replaces provider history and
+    /// cannot reuse the preceding WebSocket response lease. The input and returned retained state
+    /// remain raw; decoding is limited to Codex's existing retention predicate and never forms a
+    /// replacement JSON value.
+    pub async fn compact_remote_v2(
+        &self,
+        request: PatchRuntimeCompactionRequest,
+    ) -> Result<PatchRuntimeCompactionResult> {
+        if !self.inner.remote_compaction_v2_enabled {
+            return Err(CodexErr::UnsupportedOperation(
+                "Remote Compaction V2 is unavailable for the effective Patch runtime".to_string(),
+            ));
+        }
+        let retained_history = retained_raw_history_for_remote_v2(&request.history)?;
+        let trigger = RawValue::from_string(r#"{"type":"compaction_trigger"}"#.to_string())
+            .map_err(|error| CodexErr::Fatal(format!("encoding V2 compaction trigger: {error}")))?;
+        let raw_sink = Arc::new(CollectingRawSink::default());
+        let responses_metadata = CodexResponsesMetadata::new(
+            self.inner.installation_id.clone(),
+            request.session_id,
+            self.inner.thread_id.to_string(),
+            "patchwork".to_string(),
+        )
+        .with_turn_id(request.turn_id);
+        let telemetry = SessionTelemetry::new(
+            self.inner.thread_id,
+            self.inner.model_info.slug.as_str(),
+            self.inner.model_info.slug.as_str(),
+            None,
+            None,
+            None,
+            "patch".to_string(),
+            false,
+            "patchwork".to_string(),
+            SessionSource::Custom("patch".to_string()),
+        );
+        let mut session = self.inner.client.new_session();
+        let websocket_was_enabled = self.inner.client.responses_websocket_enabled();
+        let prompt = Prompt::new_no_tools(Vec::new(), request.base_instructions);
+        let result = session
+            .stream_full_input_with_raw_items(
+                &prompt,
+                &self.inner.model_info,
+                &telemetry,
+                None,
+                request.summary,
+                None,
+                &responses_metadata,
+                &request.history,
+                &[trigger],
+                Arc::clone(&raw_sink) as Arc<dyn codex_api::RawResponseSink>,
+            )
+            .await?;
+        let route = match result.route {
+            FullInputRoute::WebSocket => PatchRuntimeRoute::WebSocket,
+            FullInputRoute::Http => PatchRuntimeRoute::HttpFallback,
+        };
+        let mut stream = result.stream;
+        let mut compaction_output_index = None;
+        let mut output_item_count = 0usize;
+        let mut compaction_count = 0usize;
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            match event? {
+                ResponseEvent::OutputItemDone(item) => {
+                    if matches!(item, ResponseItem::Compaction { .. }) {
+                        compaction_count += 1;
+                        compaction_output_index = Some(output_item_count);
+                    }
+                    output_item_count += 1;
+                }
+                ResponseEvent::Completed { .. } => {
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if !completed {
+            return Err(CodexErr::Stream(
+                "remote compaction v2 stream closed before response.completed".to_string(),
+            ));
+        }
+        if compaction_count != 1 {
+            return Err(CodexErr::Fatal(format!(
+                "remote compaction v2 expected exactly one compaction output item, got {compaction_count} from {output_item_count} output items"
+            )));
+        }
+        let outputs = raw_sink.take_outputs();
+        let Some(compaction_output) = compaction_output_index.and_then(|index| outputs.get(index))
+        else {
+            return Err(CodexErr::Fatal(
+                "remote compaction v2 raw output did not match its typed event stream".to_string(),
+            ));
+        };
+        let route = if websocket_was_enabled && self.inner.client.responses_websocket_enabled() {
+            route
+        } else {
+            PatchRuntimeRoute::HttpFallback
+        };
+        Ok(PatchRuntimeCompactionResult {
+            retained_history,
+            compaction_output: compaction_output.clone(),
+            route,
+        })
+    }
+
     /// Creates a fresh turn session while retaining the process-local client owner.
     pub fn new_turn(&self, request: PatchRuntimeTurnRequest) -> PatchRuntimeTurn {
         PatchRuntimeTurn {
@@ -518,6 +681,94 @@ impl PatchRuntime {
             session: self.inner.client.new_session(),
         }
     }
+}
+
+#[derive(Default)]
+struct CollectingRawSink {
+    outputs: Mutex<Vec<Box<RawValue>>>,
+}
+
+impl CollectingRawSink {
+    fn take_outputs(&self) -> Vec<Box<RawValue>> {
+        std::mem::take(&mut *self.outputs.lock().expect("raw sink mutex poisoned"))
+    }
+}
+
+impl codex_api::RawResponseSink for CollectingRawSink {
+    fn record_runtime_compatibility<'a>(
+        &'a self,
+        _auth_profile_scope: &'a str,
+        _capability_revision: &'a str,
+    ) -> BoxFuture<'a, std::result::Result<(), codex_api::ApiError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn record_request_input<'a>(
+        &'a self,
+        _items: Vec<Box<RawValue>>,
+    ) -> BoxFuture<'a, std::result::Result<(), codex_api::ApiError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn record_completed_output_item<'a>(
+        &'a self,
+        item: Box<RawValue>,
+    ) -> BoxFuture<'a, std::result::Result<(), codex_api::ApiError>> {
+        Box::pin(async move {
+            self.outputs
+                .lock()
+                .expect("raw sink mutex poisoned")
+                .push(item);
+            Ok(())
+        })
+    }
+
+    fn take_transport_cancellation(&self) -> Option<BoxFuture<'static, ()>> {
+        None
+    }
+
+    fn authorize_transport_dispatch<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, std::result::Result<(), codex_api::ApiError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn retained_raw_history_for_remote_v2(history: &[Box<RawValue>]) -> Result<Vec<Box<RawValue>>> {
+    let typed_history = history
+        .iter()
+        .map(|item| {
+            serde_json::from_str::<ResponseItem>(item.get()).map_err(|error| {
+                CodexErr::UnsupportedOperation(format!(
+                    "Remote Compaction V2 cannot safely retain unrecognized native history: {error}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let retained_indices = typed_history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            (is_retained_for_remote_compaction_v2(item) && should_keep_compacted_history_item(item))
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let retained_tokens = retained_indices.iter().fold(0usize, |total, index| {
+        total.saturating_add(
+            usize::try_from(estimate_item_token_count(&typed_history[*index]))
+                .unwrap_or(usize::MAX),
+        )
+    });
+    if retained_tokens > RETAINED_MESSAGE_TOKEN_BUDGET {
+        return Err(CodexErr::UnsupportedOperation(
+            "Remote Compaction V2 would require rewriting a retained native item".to_string(),
+        ));
+    }
+    Ok(history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| retained_indices.contains(&index).then(|| item.clone()))
+        .collect())
 }
 
 impl PatchRuntimeTurn {
@@ -756,6 +1007,22 @@ mod tests {
         .expect_err("unsupported effort must not reach dispatch");
 
         assert!(error.to_string().contains("reasoning effort"));
+    }
+
+    #[test]
+    fn remote_v2_retention_keeps_selected_raw_json_verbatim() {
+        let raw = r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}],"future_native":{"opaque":true}}"#;
+        let retained = retained_raw_history_for_remote_v2(&[
+            RawValue::from_string(raw.to_owned()).expect("valid raw JSON"),
+            RawValue::from_string(
+                r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}"#.to_owned(),
+            )
+            .expect("valid raw JSON"),
+        ])
+        .expect("known native history is retainable");
+
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].get(), raw);
     }
 
     #[test]

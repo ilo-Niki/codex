@@ -509,7 +509,7 @@ fn v2_history_item_groups(
     })
 }
 
-fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool {
+pub(crate) fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool {
     if let ResponseItem::AgentMessage {
         author,
         recipient,
