@@ -313,7 +313,8 @@ pub enum PatchRuntimeInput {
 /// Request-specific input and Patch metadata for a fresh logical turn.
 pub struct PatchRuntimeTurnRequest {
     pub input: PatchRuntimeInput,
-    /// Function schemas visible to the model. Raw native replay currently remains no-tool only.
+    /// Function schemas visible to the model. Raw native replay preserves native
+    /// history opaquely while carrying the same request-level schema.
     pub tools: Vec<PatchRuntimeFunctionTool>,
     pub base_instructions: BaseInstructions,
     pub summary: ReasoningSummary,
@@ -886,12 +887,10 @@ impl PatchRuntimeTurn {
                 retained_prefix,
                 fresh_suffix,
             } => {
-                if !tools.is_empty() {
-                    return Err(CodexErr::InvalidRequest(
-                        "Patch raw native replay does not support function tools".to_string(),
-                    ));
-                }
-                let prompt = Prompt::new_no_tools(Vec::new(), base_instructions);
+                // The retained items stay raw and opaque. Function schemas are
+                // request properties, not history items, so replay carries the
+                // exact approved schema without decoding native tool state.
+                let prompt = prompt_with_patch_tools(Vec::new(), &tools, base_instructions)?;
                 let result = self
                     .session
                     .stream_full_input_with_raw_items(
