@@ -609,19 +609,9 @@ async fn process_sse_with_treatment(
 
         trace!("SSE event: {}", &sse.data);
 
-        let event: ResponsesStreamEvent = match serde_json::from_str(&sse.data) {
-            Ok(event) => event,
-            Err(e) => {
-                debug!(
-                    error_category = ?e.classify(),
-                    error_line = e.line(),
-                    error_column = e.column(),
-                    payload_bytes = sse.data.len(),
-                    "Failed to parse SSE event"
-                );
-                continue;
-            }
-        };
+        // Retain completed provider output before projecting it into Codex's
+        // evolving typed event schema. Unknown future item kinds remain opaque
+        // Patch custody even when typed projection cannot understand them.
         if let Some(raw_sink) = raw_sink.as_ref() {
             match raw_completed_output_item(&sse.data) {
                 Ok(Some(item)) => {
@@ -637,6 +627,19 @@ async fn process_sse_with_treatment(
                 }
             }
         }
+        let event: ResponsesStreamEvent = match serde_json::from_str(&sse.data) {
+            Ok(event) => event,
+            Err(e) => {
+                debug!(
+                    error_category = ?e.classify(),
+                    error_line = e.line(),
+                    error_column = e.column(),
+                    payload_bytes = sse.data.len(),
+                    "Failed to parse SSE event"
+                );
+                continue;
+            }
+        };
         let model_verifications = event.model_verifications();
         let turn_moderation_metadata = event.turn_moderation_metadata();
         let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
