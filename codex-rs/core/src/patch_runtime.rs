@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
+use serde_json::Value;
 use serde_json::value::RawValue;
 use sha2::Digest;
 use sha2::Sha256;
@@ -37,6 +38,8 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_tools::ResponsesApiTool;
+use codex_tools::ToolSpec;
 
 use crate::client_common::ResponseEvent;
 use crate::compact_remote::should_keep_compacted_history_item;
@@ -284,6 +287,17 @@ pub fn classify_patch_runtime_error(error: &CodexErr) -> Option<PatchRuntimeFail
     }
 }
 
+/// A function schema advertised to Codex for one Patch logical turn.
+///
+/// Patch owns the schema as JSON. The facade converts it to Codex's maintained Responses tool
+/// representation at dispatch time and never owns a tool executor or effectful runtime.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatchRuntimeFunctionTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
 /// Input mode for one Patch logical turn.
 pub enum PatchRuntimeInput {
     /// Canonical typed input. The maintained ModelClientSession may use its cached WebSocket
@@ -299,6 +313,8 @@ pub enum PatchRuntimeInput {
 /// Request-specific input and Patch metadata for a fresh logical turn.
 pub struct PatchRuntimeTurnRequest {
     pub input: PatchRuntimeInput,
+    /// Function schemas visible to the model. Raw native replay currently remains no-tool only.
+    pub tools: Vec<PatchRuntimeFunctionTool>,
     pub base_instructions: BaseInstructions,
     pub summary: ReasoningSummary,
     pub session_id: String,
@@ -734,6 +750,43 @@ impl codex_api::RawResponseSink for CollectingRawSink {
     }
 }
 
+fn patch_function_tools_to_codex(tools: &[PatchRuntimeFunctionTool]) -> Result<Vec<ToolSpec>> {
+    tools
+        .iter()
+        .map(|tool| {
+            let parameters = serde_json::from_value(tool.parameters.clone()).map_err(|error| {
+                CodexErr::InvalidRequest(format!(
+                    "invalid JSON schema for Patch function tool `{}`: {error}",
+                    tool.name
+                ))
+            })?;
+            Ok(ToolSpec::Function(ResponsesApiTool {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                strict: false,
+                defer_loading: None,
+                parameters,
+                output_schema: None,
+            }))
+        })
+        .collect()
+}
+
+fn prompt_with_patch_tools(
+    input: Vec<ResponseItem>,
+    tools: &[PatchRuntimeFunctionTool],
+    base_instructions: BaseInstructions,
+) -> Result<Prompt> {
+    if tools.is_empty() {
+        return Ok(Prompt::new_no_tools(input, base_instructions));
+    }
+    Ok(Prompt::new_with_tools(
+        input,
+        patch_function_tools_to_codex(tools)?,
+        base_instructions,
+    ))
+}
+
 fn retained_raw_history_for_remote_v2(history: &[Box<RawValue>]) -> Result<Vec<Box<RawValue>>> {
     let typed_history = history
         .iter()
@@ -777,6 +830,7 @@ impl PatchRuntimeTurn {
     pub async fn stream(mut self) -> Result<PatchRuntimeStream> {
         let PatchRuntimeTurnRequest {
             input,
+            tools,
             base_instructions,
             summary,
             session_id,
@@ -805,7 +859,7 @@ impl PatchRuntimeTurn {
         let (stream, route) = match input {
             PatchRuntimeInput::Typed(items) => {
                 let websocket_was_enabled = self.runtime.client.responses_websocket_enabled();
-                let prompt = Prompt::new_no_tools(items, base_instructions);
+                let prompt = prompt_with_patch_tools(items, &tools, base_instructions)?;
                 let stream = self
                     .session
                     .stream_with_raw_sink(
@@ -832,6 +886,11 @@ impl PatchRuntimeTurn {
                 retained_prefix,
                 fresh_suffix,
             } => {
+                if !tools.is_empty() {
+                    return Err(CodexErr::InvalidRequest(
+                        "Patch raw native replay does not support function tools".to_string(),
+                    ));
+                }
                 let prompt = Prompt::new_no_tools(Vec::new(), base_instructions);
                 let result = self
                     .session
@@ -854,6 +913,68 @@ impl PatchRuntimeTurn {
                 };
                 (result.stream, route)
             }
+        };
+        Ok(PatchRuntimeStream {
+            stream,
+            route,
+            auth_profile_scope: self.runtime.auth_profile_scope.clone(),
+            capability_revision: self.runtime.capability_revision.clone(),
+        })
+    }
+
+    /// Streams a full typed logical history while retaining this turn's WebSocket session.
+    ///
+    /// Call this once to start a tool-enabled request and again after appending native tool-call
+    /// results. Codex's maintained request-property and strict-prefix checks decide whether the
+    /// existing `previous_response_id` can be reused. Every request and completed output item is
+    /// sent to the raw sink supplied when the turn was created.
+    pub async fn stream_typed(
+        &mut self,
+        full_history: Vec<ResponseItem>,
+    ) -> Result<PatchRuntimeStream> {
+        let responses_metadata = CodexResponsesMetadata::new(
+            self.runtime.installation_id.clone(),
+            self.request.session_id.clone(),
+            self.runtime.thread_id.to_string(),
+            "patchwork".to_string(),
+        )
+        .with_turn_id(self.request.turn_id.clone());
+        let telemetry = SessionTelemetry::new(
+            self.runtime.thread_id,
+            self.runtime.model_info.slug.as_str(),
+            self.runtime.model_info.slug.as_str(),
+            None,
+            None,
+            None,
+            "patch".to_string(),
+            false,
+            "patchwork".to_string(),
+            SessionSource::Custom("patch".to_string()),
+        );
+        let websocket_was_enabled = self.runtime.client.responses_websocket_enabled();
+        let prompt = prompt_with_patch_tools(
+            full_history,
+            &self.request.tools,
+            self.request.base_instructions.clone(),
+        )?;
+        let stream = self
+            .session
+            .stream_with_raw_sink(
+                &prompt,
+                &self.runtime.model_info,
+                &telemetry,
+                None,
+                self.request.summary,
+                None,
+                &responses_metadata,
+                &InferenceTraceContext::disabled(),
+                Some(Arc::clone(&self.request.raw_sink)),
+            )
+            .await?;
+        let route = if websocket_was_enabled && self.runtime.client.responses_websocket_enabled() {
+            PatchRuntimeRoute::WebSocket
+        } else {
+            PatchRuntimeRoute::HttpFallback
         };
         Ok(PatchRuntimeStream {
             stream,
@@ -1007,6 +1128,48 @@ mod tests {
         .expect_err("unsupported effort must not reach dispatch");
 
         assert!(error.to_string().contains("reasoning effort"));
+    }
+
+    #[test]
+    fn converts_patch_function_tool_schema_without_losing_advertised_fields() {
+        let tools = patch_function_tools_to_codex(&[PatchRuntimeFunctionTool {
+            name: "lookup".to_string(),
+            description: "Look up a value".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+                "additionalProperties": false
+            }),
+        }])
+        .expect("valid function schema should convert");
+
+        let [ToolSpec::Function(tool)] = tools.as_slice() else {
+            panic!("expected one function tool");
+        };
+        assert_eq!(tool.name, "lookup");
+        assert_eq!(tool.description, "Look up a value");
+        assert!(!tool.strict);
+        assert_eq!(
+            serde_json::to_value(&tool.parameters).unwrap(),
+            json!({
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn no_tool_prompt_path_remains_empty_and_strict_by_default() {
+        let prompt = prompt_with_patch_tools(Vec::new(), &[], BaseInstructions::default())
+            .expect("empty tool set should remain valid");
+
+        assert!(prompt.tools.is_empty());
+        assert!(!prompt.parallel_tool_calls);
+        assert!(prompt.output_schema.is_none());
+        assert!(prompt.output_schema_strict);
     }
 
     #[test]

@@ -62,6 +62,21 @@ impl Prompt {
         }
     }
 
+    pub(crate) fn new_with_tools(
+        input: Vec<ResponseItem>,
+        tools: Vec<ToolSpec>,
+        base_instructions: BaseInstructions,
+    ) -> Self {
+        Self {
+            input,
+            tools: tools.into(),
+            parallel_tool_calls: false,
+            base_instructions,
+            output_schema: None,
+            output_schema_strict: true,
+        }
+    }
+
     pub(crate) fn get_formatted_input_for_request(
         &self,
         use_responses_lite: bool,
