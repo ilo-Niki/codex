@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -54,6 +55,7 @@ use crate::client::FullInputRoute;
 use crate::config::ConfigBuilder;
 use crate::installation_id::resolve_installation_id;
 use crate::responses_metadata::CodexResponsesMetadata;
+use crate::util::backoff;
 
 /// Inputs for one isolated Patch-to-Codex request.
 ///
@@ -343,11 +345,54 @@ pub struct PatchRuntimeCompactionResult {
     pub route: PatchRuntimeRoute,
 }
 
+/// One decision from the bounded provider-native stream retry policy.
+///
+/// `NotRetryable` covers semantic or permanent rejections. `Exhausted` means
+/// the configured retry policy and its fallback route are spent. The caller
+/// retains the original `CodexErr` and must surface it as the terminal provider
+/// outcome.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PatchRuntimeRetryDecision {
+    RetryAfter(Duration),
+    NotRetryable,
+    Exhausted,
+}
+
+#[derive(Default)]
+struct PatchRuntimeRetryState {
+    retries: u64,
+}
+
+impl PatchRuntimeRetryState {
+    fn next(
+        &mut self,
+        error: &CodexErr,
+        max_retries: u64,
+        fallback_transport_selected: bool,
+    ) -> PatchRuntimeRetryDecision {
+        if !error.is_retryable() {
+            return PatchRuntimeRetryDecision::NotRetryable;
+        }
+        if self.retries >= max_retries && fallback_transport_selected {
+            self.retries = 0;
+            return PatchRuntimeRetryDecision::RetryAfter(Duration::ZERO);
+        }
+        if self.retries < max_retries {
+            self.retries += 1;
+            return PatchRuntimeRetryDecision::RetryAfter(
+                error.retry_delay().unwrap_or_else(|| backoff(self.retries)),
+            );
+        }
+        PatchRuntimeRetryDecision::Exhausted
+    }
+}
+
 /// One fresh ModelClientSession. Construct one per Patch logical turn.
 pub struct PatchRuntimeTurn {
     runtime: Arc<PatchRuntimeInner>,
     request: PatchRuntimeTurnRequest,
     session: crate::client::ModelClientSession,
+    retry_state: PatchRuntimeRetryState,
 }
 
 struct PatchRuntimeInner {
@@ -696,6 +741,7 @@ impl PatchRuntime {
             runtime: Arc::clone(&self.inner),
             request,
             session: self.inner.client.new_session(),
+            retry_state: PatchRuntimeRetryState::default(),
         }
     }
 }
@@ -825,26 +871,51 @@ fn retained_raw_history_for_remote_v2(history: &[Box<RawValue>]) -> Result<Vec<B
         .collect())
 }
 
+fn patch_runtime_telemetry(runtime: &PatchRuntimeInner) -> SessionTelemetry {
+    SessionTelemetry::new(
+        runtime.thread_id,
+        runtime.model_info.slug.as_str(),
+        runtime.model_info.slug.as_str(),
+        None,
+        None,
+        None,
+        "patch".to_string(),
+        false,
+        "patchwork".to_string(),
+        SessionSource::Custom("patch".to_string()),
+    )
+}
+
 impl PatchRuntimeTurn {
+    /// Applies Codex's configured, bounded stream-retry policy to one failed
+    /// request in this same Patch turn session.
+    ///
+    /// The adapter owns cancellation, custody rollback, and reissuing identical
+    /// input, so it calls this only after abandoning an incomplete response.
+    /// No new Patch turn, composition attempt, or scheduler reservation is made.
+    pub fn retry_stream_error(&mut self, error: &CodexErr) -> PatchRuntimeRetryDecision {
+        let max_retries = self.runtime.provider_info.stream_max_retries();
+        let fallback_transport_selected = error.is_retryable()
+            && self.retry_state.retries >= max_retries
+            && self.session.try_switch_fallback_transport(
+                &patch_runtime_telemetry(&self.runtime),
+                &self.runtime.model_info,
+            );
+        self.retry_state
+            .next(error, max_retries, fallback_transport_selected)
+    }
+
     /// Streams one raw full-input turn. The route is explicit and is either WebSocket or the
-    /// maintained supported HTTP fallback; no unbounded retry policy is enabled here.
-    pub async fn stream(mut self) -> Result<PatchRuntimeStream> {
-        let PatchRuntimeTurnRequest {
-            input,
-            tools,
-            base_instructions,
-            summary,
-            session_id,
-            turn_id,
-            raw_sink,
-        } = self.request;
+    /// maintained supported HTTP fallback; retry decisions are exposed separately so the caller
+    /// can preserve cancellation and raw-custody boundaries.
+    pub async fn stream(&mut self) -> Result<PatchRuntimeStream> {
         let responses_metadata = CodexResponsesMetadata::new(
             self.runtime.installation_id.clone(),
-            session_id,
+            self.request.session_id.clone(),
             self.runtime.thread_id.to_string(),
             "patchwork".to_string(),
         )
-        .with_turn_id(turn_id);
+        .with_turn_id(self.request.turn_id.clone());
         let telemetry = SessionTelemetry::new(
             self.runtime.thread_id,
             self.runtime.model_info.slug.as_str(),
@@ -857,10 +928,14 @@ impl PatchRuntimeTurn {
             "patchwork".to_string(),
             SessionSource::Custom("patch".to_string()),
         );
-        let (stream, route) = match input {
+        let (stream, route) = match &self.request.input {
             PatchRuntimeInput::Typed(items) => {
                 let websocket_was_enabled = self.runtime.client.responses_websocket_enabled();
-                let prompt = prompt_with_patch_tools(items, &tools, base_instructions)?;
+                let prompt = prompt_with_patch_tools(
+                    items.clone(),
+                    &self.request.tools,
+                    self.request.base_instructions.clone(),
+                )?;
                 let stream = self
                     .session
                     .stream_with_raw_sink(
@@ -868,11 +943,11 @@ impl PatchRuntimeTurn {
                         &self.runtime.model_info,
                         &telemetry,
                         None,
-                        summary,
+                        self.request.summary,
                         None,
                         &responses_metadata,
                         &InferenceTraceContext::disabled(),
-                        Some(Arc::clone(&raw_sink)),
+                        Some(Arc::clone(&self.request.raw_sink)),
                     )
                     .await?;
                 let route =
@@ -890,7 +965,11 @@ impl PatchRuntimeTurn {
                 // The retained items stay raw and opaque. Function schemas are
                 // request properties, not history items, so replay carries the
                 // exact approved schema without decoding native tool state.
-                let prompt = prompt_with_patch_tools(Vec::new(), &tools, base_instructions)?;
+                let prompt = prompt_with_patch_tools(
+                    Vec::new(),
+                    &self.request.tools,
+                    self.request.base_instructions.clone(),
+                )?;
                 let result = self
                     .session
                     .stream_full_input_with_raw_items(
@@ -898,12 +977,12 @@ impl PatchRuntimeTurn {
                         &self.runtime.model_info,
                         &telemetry,
                         None,
-                        summary,
+                        self.request.summary,
                         None,
                         &responses_metadata,
-                        &retained_prefix,
-                        &fresh_suffix,
-                        raw_sink,
+                        retained_prefix,
+                        fresh_suffix,
+                        Arc::clone(&self.request.raw_sink),
                     )
                     .await?;
                 let route = match result.route {
@@ -1079,6 +1158,41 @@ mod tests {
             },
             provenance,
         }
+    }
+
+    #[test]
+    fn patch_retry_state_uses_bounded_native_policy_and_fallback() {
+        let transient = CodexErr::new(codex_protocol::error::CodexErrorDetails::Stream(
+            "disconnected before response.completed".to_owned(),
+        ));
+        let mut retry = PatchRuntimeRetryState::default();
+        assert!(matches!(
+            retry.next(&transient, 1, false),
+            PatchRuntimeRetryDecision::RetryAfter(delay) if !delay.is_zero()
+        ));
+        assert_eq!(
+            retry.next(&transient, 1, false),
+            PatchRuntimeRetryDecision::Exhausted
+        );
+        assert_eq!(
+            retry.next(&transient, 1, true),
+            PatchRuntimeRetryDecision::RetryAfter(Duration::ZERO)
+        );
+        assert!(matches!(
+            retry.next(&transient, 1, false),
+            PatchRuntimeRetryDecision::RetryAfter(_)
+        ));
+    }
+
+    #[test]
+    fn patch_retry_state_rejects_semantic_errors_without_retry() {
+        let permanent = CodexErr::new(codex_protocol::error::CodexErrorDetails::InvalidRequest(
+            "unchanged input is invalid".to_owned(),
+        ));
+        assert_eq!(
+            PatchRuntimeRetryState::default().next(&permanent, 5, true),
+            PatchRuntimeRetryDecision::NotRetryable
+        );
     }
 
     #[test]
